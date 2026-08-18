@@ -1,7 +1,17 @@
+from fractions import Fraction
+
 import pytest
 import torch
 
-from comfyui_tools.av_nodes import AudioMask, parse_intervals, video_frame_info
+from comfyui_tools import av_nodes
+from comfyui_tools.av_nodes import (
+    AudioMask,
+    SilentAudio,
+    VideoAddSilentAudio,
+    parse_intervals,
+    silent_audio,
+    video_frame_info,
+)
 
 
 class FakeVideo:
@@ -153,3 +163,116 @@ def test_parse_intervals_rejects_garbage():
 def test_zero_frames_is_rejected():
     with pytest.raises(ValueError):
         build(frames=0)
+
+
+class FakeComponents:
+    def __init__(self, images, frame_rate, audio=None, metadata=None):
+        self.images = images
+        self.frame_rate = frame_rate
+        self.audio = audio
+        self.metadata = metadata
+
+
+class FakeVideoWithComponents:
+    """A VIDEO whose components can carry (or lack) an audio track."""
+
+    def __init__(self, frames=10, frame_rate=Fraction(10, 1), audio=None):
+        self.components = FakeComponents(
+            torch.zeros((frames, 8, 8, 3)), frame_rate, audio
+        )
+
+    def get_components(self):
+        return self.components
+
+
+@pytest.fixture
+def comfy_api(monkeypatch):
+    """Stand in for comfy_api's VideoComponents / VideoFromComponents."""
+    built = {}
+
+    def from_components(components):
+        built["components"] = components
+        return components
+
+    monkeypatch.setattr(av_nodes, "VideoComponents", FakeComponents)
+    monkeypatch.setattr(av_nodes, "VideoFromComponents", from_components)
+    return built
+
+
+def test_silent_audio_helper_shape_and_rate():
+    audio = silent_audio(2.0, 32000, "stereo")
+    assert audio["sample_rate"] == 32000
+    assert audio["waveform"].shape == (1, 2, 64000)
+    assert audio["waveform"].abs().max() == 0.0
+
+
+def test_silent_audio_helper_mono_and_batch():
+    audio = silent_audio(0.5, 16000, "mono", batch_size=3)
+    assert audio["waveform"].shape == (3, 1, 8000)
+
+
+def test_silent_audio_helper_rounds_up_to_a_whole_sample():
+    assert silent_audio(0.00001, 32000, "mono")["waveform"].shape[-1] == 1
+
+
+def test_silent_audio_helper_rejects_empty_audio():
+    with pytest.raises(ValueError):
+        silent_audio(0.0, 32000, "stereo")
+    with pytest.raises(ValueError):
+        silent_audio(1.0, 0, "stereo")
+
+
+def test_silent_audio_node_uses_seconds():
+    audio, seconds, samples = SilentAudio().generate(2.0, 0, 25.0, 32000, "stereo", 1)
+    assert (seconds, samples) == (2.0, 64000)
+    assert audio["waveform"].shape == (1, 2, 64000)
+
+
+def test_silent_audio_node_uses_the_frame_count():
+    _, seconds, samples = SilentAudio().generate(2.0, 50, 25.0, 32000, "mono", 1)
+    assert seconds == 2.0 and samples == 64000
+
+
+def test_silent_audio_node_takes_the_duration_from_the_video():
+    _, seconds, _ = SilentAudio().generate(2.0, 0, 25.0, 32000, "stereo", 1,
+                                           video=FakeVideo(48, 24.0))
+    assert seconds == 2.0
+
+
+def test_add_silent_audio_matches_the_video_length(comfy_api):
+    video = FakeVideoWithComponents(frames=30, frame_rate=Fraction(30, 1))
+    patched, audio = VideoAddSilentAudio().run(video, 32000, "stereo", False)
+
+    assert audio["waveform"].shape == (1, 2, 32000)  # 30 frames @ 30 fps = 1 s
+    assert patched is comfy_api["components"]
+    assert patched.audio is audio
+    assert patched.frame_rate == Fraction(30, 1)
+    assert patched.images is video.components.images
+
+
+def test_add_silent_audio_accepts_a_float_frame_rate(comfy_api):
+    video = FakeVideoWithComponents(frames=12, frame_rate=24.0)
+    _, audio = VideoAddSilentAudio().run(video, 16000, "mono", False)
+    assert audio["waveform"].shape == (1, 1, 8000)  # 0.5 s
+
+
+def test_add_silent_audio_keeps_an_existing_track(comfy_api):
+    existing = silent_audio(1.0, 44100, "stereo")
+    video = FakeVideoWithComponents(audio=existing)
+    result, audio = VideoAddSilentAudio().run(video, 32000, "stereo", False)
+    assert result is video and audio is existing
+    assert "components" not in comfy_api
+
+
+def test_add_silent_audio_can_replace_an_existing_track(comfy_api):
+    existing = silent_audio(1.0, 44100, "stereo")
+    video = FakeVideoWithComponents(frames=10, frame_rate=Fraction(10, 1), audio=existing)
+    _, audio = VideoAddSilentAudio().run(video, 32000, "stereo", True)
+    assert audio is not existing
+    assert audio["sample_rate"] == 32000
+
+
+def test_add_silent_audio_needs_the_comfy_runtime(monkeypatch):
+    monkeypatch.setattr(av_nodes, "VideoFromComponents", None)
+    with pytest.raises(RuntimeError):
+        VideoAddSilentAudio().run(FakeVideoWithComponents(), 32000, "stereo", False)

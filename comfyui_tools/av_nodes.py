@@ -5,14 +5,29 @@
 the audio at this moment" and ``0`` means "keep the original audio". When you
 only inpaint the picture there is nothing upstream producing that mask, so
 ``AudioMask`` below builds one -- an all-zero stub by default.
+
+AV Encode also reads the audio track from the VIDEO itself, so a clip with no
+sound at all fails before the mask is even used ("the video has no audio track
+to encode"). ``SilentAudio`` and ``VideoAddSilentAudio`` fill that gap with a
+silent track of the right length.
 """
 
 import json
 import math
+from fractions import Fraction
 
 import torch
 
 from .utils import CATEGORY
+
+try:  # available when running inside ComfyUI
+    from comfy_api.latest._input_impl.video_types import VideoFromComponents
+    from comfy_api.latest._util.video_types import VideoComponents
+except Exception:  # pragma: no cover - exercised only outside ComfyUI
+    VideoFromComponents = None
+    VideoComponents = None
+
+CHANNEL_LAYOUTS = {"mono": 1, "stereo": 2}
 
 
 def parse_intervals(text):
@@ -83,6 +98,27 @@ def video_frame_info(video):
                 fps = float(rate)
 
     return frames, fps
+
+
+def silent_audio(seconds, sample_rate, channels="stereo", batch_size=1):
+    """Build a ComfyUI ``AUDIO`` dict holding ``seconds`` of silence."""
+    if seconds <= 0:
+        raise ValueError("the silence needs a positive duration")
+    if sample_rate <= 0:
+        raise ValueError("the sample rate must be positive")
+
+    count = CHANNEL_LAYOUTS.get(channels, channels if isinstance(channels, int) else 2)
+    samples = int(math.ceil(seconds * sample_rate))
+    waveform = torch.zeros((int(batch_size), int(count), samples), dtype=torch.float32)
+    return {"waveform": waveform, "sample_rate": int(sample_rate)}
+
+
+def video_seconds(video):
+    """Duration of a ``VIDEO`` in seconds, from its frame count and frame rate."""
+    frames, fps = video_frame_info(video)
+    if not frames or not fps:
+        raise ValueError("could not read the frame count and frame rate of the video")
+    return frames / fps
 
 
 class AudioMask:
@@ -175,10 +211,121 @@ class AudioMask:
         return (mask, frames, fps)
 
 
+class SilentAudio:
+    """Generate a silent ``AUDIO`` track.
+
+    Handy whenever a node insists on audio you do not have -- the MiniMax H3
+    audio VAE runs at 32 kHz, so the default sample rate avoids a resample.
+    """
+
+    CHANNELS = ["stereo", "mono"]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "seconds": ("FLOAT", {
+                    "default": 5.0, "min": 0.01, "max": 3600.0, "step": 0.01,
+                    "tooltip": "Duration, used when no video is connected and frames is 0.",
+                }),
+                "frames": ("INT", {
+                    "default": 0, "min": 0, "max": 100000, "step": 1,
+                    "tooltip": "Length in video frames; 0 means use the seconds widget.",
+                }),
+                "fps": ("FLOAT", {"default": 25.0, "min": 0.01, "max": 1000.0, "step": 0.01}),
+                "sample_rate": ("INT", {
+                    "default": 32000, "min": 1000, "max": 192000, "step": 100,
+                    "tooltip": "32000 matches the MiniMax H3 audio VAE, so nothing has to be resampled.",
+                }),
+                "channels": (cls.CHANNELS, {"default": "stereo"}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 64, "step": 1}),
+            },
+            "optional": {
+                "video": ("VIDEO", {"tooltip": "The duration is taken from the video when connected."}),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO", "FLOAT", "INT")
+    RETURN_NAMES = ("audio", "seconds", "samples")
+    FUNCTION = "generate"
+    CATEGORY = f"{CATEGORY}/av"
+    DESCRIPTION = "Silent audio track of a given length (from a video, a frame count or seconds)."
+
+    def generate(self, seconds, frames, fps, sample_rate, channels, batch_size, video=None):
+        if video is not None:
+            seconds = video_seconds(video)
+        elif frames > 0:
+            seconds = frames / fps
+        audio = silent_audio(seconds, sample_rate, channels, batch_size)
+        return (audio, float(seconds), int(audio["waveform"].shape[-1]))
+
+
+class VideoAddSilentAudio:
+    """Attach a silent audio track to a video that has none.
+
+    LanPaint AV Encode decodes the audio out of the VIDEO itself and raises
+    "the video has no audio track to encode" on a silent clip. Run the video
+    through this node first and AV Encode gets a track exactly as long as the
+    picture; pair it with ``AudioMask`` in ``keep_all`` mode so the silence is
+    never resampled.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO", {"tooltip": "The video to give a silent audio track."}),
+                "sample_rate": ("INT", {
+                    "default": 32000, "min": 1000, "max": 192000, "step": 100,
+                    "tooltip": "32000 matches the MiniMax H3 audio VAE, so nothing has to be resampled.",
+                }),
+                "channels": (SilentAudio.CHANNELS, {"default": "stereo"}),
+                "replace_existing": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Off: a video that already has audio is passed through untouched.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("VIDEO", "AUDIO")
+    RETURN_NAMES = ("video", "audio")
+    FUNCTION = "run"
+    CATEGORY = f"{CATEGORY}/av"
+    DESCRIPTION = ("Give a soundless video a silent audio track of the same length, "
+                   "so LanPaint AV Encode can encode it.")
+
+    def run(self, video, sample_rate, channels, replace_existing):
+        if VideoFromComponents is None or VideoComponents is None:
+            raise RuntimeError("this node requires the ComfyUI runtime (comfy_api)")
+
+        components = video.get_components()
+        existing = getattr(components, "audio", None)
+        if existing is not None and not replace_existing:
+            return (video, existing)
+
+        rate = components.frame_rate
+        if not isinstance(rate, Fraction):
+            rate = Fraction(float(rate)).limit_denominator(1000000)
+        frames = int(components.images.shape[0])
+        audio = silent_audio(frames / float(rate), sample_rate, channels)
+
+        patched = VideoComponents(
+            images=components.images,
+            frame_rate=rate,
+            audio=audio,
+            metadata=getattr(components, "metadata", None),
+        )
+        return (VideoFromComponents(patched), audio)
+
+
 NODE_CLASS_MAPPINGS = {
     "ToolsAudioMask": AudioMask,
+    "ToolsSilentAudio": SilentAudio,
+    "ToolsVideoAddSilentAudio": VideoAddSilentAudio,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ToolsAudioMask": "Audio Mask (tools)",
+    "ToolsSilentAudio": "Silent Audio (tools)",
+    "ToolsVideoAddSilentAudio": "Video Add Silent Audio (tools)",
 }

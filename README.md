@@ -37,23 +37,29 @@ There are no extra dependencies — the pack only uses `torch`, which ComfyUI al
 | Node | What it does |
 | --- | --- |
 | **Audio Mask** | Builds the `audio_mask` that [LanPaint](https://github.com/scraed/LanPaint) **AV Encode** requires: a `MASK` of shape `[F]` at the video frame rate, `1` = regenerate the audio at that moment, `0` = keep it. Defaults to an all-zero stub for video-only inpainting; can also regenerate everything or only the time ranges you list. |
+| **Video Add Silent Audio** | Gives a soundless video a silent audio track exactly as long as the picture, so AV Encode stops raising *"the video has no audio track to encode"*. A video that already has audio is passed through untouched unless you ask for a replacement. |
+| **Silent Audio** | A standalone silent `AUDIO` track, sized from a video, a frame count or plain seconds. |
 
-Frame count and fps are taken from the connected `video`, or from a per-frame
-`video_mask` (whose frame count wins), or from the widgets when nothing is
-connected — so the mask always matches the clip you feed AV Encode.
+Frame count and fps for the mask are taken from the connected `video`, or from
+a per-frame `video_mask` (whose frame count wins), or from the widgets when
+nothing is connected — so the mask always matches the clip you feed AV Encode.
+
+Video-only inpainting on a clip with no sound at all:
 
 ```
-LanPaint Video Mask Editor ──video──┬─────────────► LanPaint AV Encode.video
-                           ──mask───┼──────────────► LanPaint AV Encode.mask
-                                    └──► Audio Mask ──► LanPaint AV Encode.audio_mask
+Video ──► Video Add Silent Audio ──video──► LanPaint AV Encode.video
+mask ────────────────────────────────────► LanPaint AV Encode.mask
+Audio Mask (keep_all) ───────────────────────► LanPaint AV Encode.audio_mask
 ```
 
-Modes: `keep_all` (zeros — the stub), `regenerate_all` (ones), `intervals`
-(seconds, one range per line: `0.5-2.0`; the editor's
+`Audio Mask` modes: `keep_all` (zeros — the stub), `regenerate_all` (ones),
+`intervals` (seconds, one range per line: `0.5-2.0`; the editor's
 `[{"start": 0.5, "end": 2.0}]` JSON is accepted too, with the same frame
-rounding LanPaint uses). Note that AV Encode still needs the source video to
-carry an audio track — the mask decides what is regenerated, not whether audio
-exists.
+rounding LanPaint uses).
+
+Both silence nodes default to a 32 kHz sample rate, which is what the MiniMax
+H3 audio VAE runs at, so LanPaint never has to resample (that path needs
+`torchaudio`).
 
 ### tools/text
 
