@@ -27,4 +27,10 @@ def test_all_node_packs_are_discovered():
     categories = {
         node_class.CATEGORY for node_class in comfyui_tools.NODE_CLASS_MAPPINGS.values()
     }
-    assert categories == {"tools/image", "tools/mask", "tools/text", "tools/logic"}
+    assert categories == {
+        "tools/image",
+        "tools/mask",
+        "tools/text",
+        "tools/logic",
+        "tools/av",
+    }

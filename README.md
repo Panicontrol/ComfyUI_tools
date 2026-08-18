@@ -1,7 +1,7 @@
 # ComfyUI_tools
 
 A small pack of quality-of-life custom nodes for [ComfyUI](https://github.com/comfyanonymous/ComfyUI):
-image sizing, mask editing, prompt building and workflow logic — the glue nodes you end up
+image sizing, mask editing, prompt building, AV inpainting helpers and workflow logic — the glue nodes you end up
 rebuilding in every workflow.
 
 ## Installation
@@ -31,6 +31,29 @@ There are no extra dependencies — the pack only uses `torch`, which ComfyUI al
 | **Mask Grow / Feather** | Grow or shrink a mask by N pixels, soften the edge with a Gaussian feather, optionally invert. |
 | **Mask Combine** | Union, intersection, difference, add, multiply or xor of two masks, with a strength factor for the second one. Mismatched sizes are resampled automatically. |
 | **Mask Bounding Box** | Bounding box (x, y, width, height) of the non-empty area of a mask, with optional padding, plus the mask's coverage ratio. |
+
+### tools/av
+
+| Node | What it does |
+| --- | --- |
+| **Audio Mask** | Builds the `audio_mask` that [LanPaint](https://github.com/scraed/LanPaint) **AV Encode** requires: a `MASK` of shape `[F]` at the video frame rate, `1` = regenerate the audio at that moment, `0` = keep it. Defaults to an all-zero stub for video-only inpainting; can also regenerate everything or only the time ranges you list. |
+
+Frame count and fps are taken from the connected `video`, or from a per-frame
+`video_mask` (whose frame count wins), or from the widgets when nothing is
+connected — so the mask always matches the clip you feed AV Encode.
+
+```
+LanPaint Video Mask Editor ──video──┬─────────────► LanPaint AV Encode.video
+                           ──mask───┼──────────────► LanPaint AV Encode.mask
+                                    └──► Audio Mask ──► LanPaint AV Encode.audio_mask
+```
+
+Modes: `keep_all` (zeros — the stub), `regenerate_all` (ones), `intervals`
+(seconds, one range per line: `0.5-2.0`; the editor's
+`[{"start": 0.5, "end": 2.0}]` JSON is accepted too, with the same frame
+rounding LanPaint uses). Note that AV Encode still needs the source video to
+carry an audio track — the mask decides what is regenerated, not whether audio
+exists.
 
 ### tools/text
 
