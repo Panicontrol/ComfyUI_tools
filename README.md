@@ -47,9 +47,9 @@ nothing is connected — so the mask always matches the clip you feed AV Encode.
 Video-only inpainting on a clip with no sound at all:
 
 ```
-Video ──► Video Add Silent Audio ──video──► LanPaint AV Encode.video
-mask ────────────────────────────────────► LanPaint AV Encode.mask
-Audio Mask (keep_all) ───────────────────────► LanPaint AV Encode.audio_mask
+Video -> Video Add Silent Audio -> LanPaint AV Encode (video)
+mask -> LanPaint AV Encode (mask)
+Audio Mask, mode keep_all -> LanPaint AV Encode (audio_mask)
 ```
 
 `Audio Mask` modes: `keep_all` (zeros — the stub), `regenerate_all` (ones),
