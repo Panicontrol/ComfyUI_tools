@@ -1,0 +1,19 @@
+[project]
+name = "comfyui_tools"
+version = "0.1.0"
+description = "A collection of image, mask, text and workflow utility nodes for ComfyUI."
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/Panicontrol/ComfyUI_tools"
+
+[tool.comfy]
+PublisherId = "panicontrol"
+DisplayName = "ComfyUI_tools"
+Icon = ""
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

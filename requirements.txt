@@ -1,0 +1,2 @@
+# torch, torchvision and numpy are provided by the ComfyUI runtime itself,
+# so this pack intentionally has no runtime dependencies of its own.
