@@ -76,6 +76,11 @@ stays in the widget, so lowering the count and raising it again brings the
 paragraph back. Cells also accept `STRING` links, so a shared paragraph can come
 from another node.
 
+Cells size themselves to their own text: a one-line paragraph gets a one-line
+cell, a long one grows up to 20 lines and then scrolls. `cell_lines` overrides
+that — set it to N and every cell becomes exactly N lines tall (0 = grow with
+the text). It is an editor-only widget; the Python side ignores it.
+
 Other widgets: `separator` (blank line, new line, space, comma, none, custom —
 `\n` and `\t` work in `custom_separator`), `skip_empty`, `strip`, and
 `comment_prefix` (default `//`) which mutes any cell that starts with it — handy

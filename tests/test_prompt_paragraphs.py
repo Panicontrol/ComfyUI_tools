@@ -1,3 +1,5 @@
+import inspect
+
 import pytest
 
 from comfyui_tools.text_nodes import MAX_PARAGRAPHS, PromptParagraphs, unescape
@@ -19,9 +21,22 @@ def build(**kwargs):
 
 def test_every_cell_is_declared_and_optional():
     types = PromptParagraphs.INPUT_TYPES()
-    assert len(types["optional"]) == MAX_PARAGRAPHS
+    cells = [name for name in types["optional"] if name.startswith("text_")]
+    assert len(cells) == MAX_PARAGRAPHS
     assert types["optional"]["text_1"][1]["multiline"] is True
     assert types["required"]["paragraphs"][1]["max"] == MAX_PARAGRAPHS
+
+
+def test_cell_lines_is_an_editor_only_widget():
+    # declared so it is saved with the workflow, ignored when building the text
+    assert "cell_lines" in PromptParagraphs.INPUT_TYPES()["optional"]
+    assert build(cell_lines=6, text_1="a", text_2="b") == build(text_1="a", text_2="b")
+
+
+def test_cell_lines_defaults_when_an_old_workflow_omits_it():
+    default = inspect.signature(PromptParagraphs.build).parameters["cell_lines"].default
+    assert default == 0
+    assert build(text_1="a") == ("a", 1)
 
 
 def test_joins_the_cells_with_a_blank_line():

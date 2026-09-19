@@ -164,8 +164,15 @@ class PromptParagraphs:
                 }),
             },
             "optional": {
-                f"text_{i}": ("STRING", {"default": "", "multiline": True})
-                for i in range(1, cls.MAX + 1)
+                "cell_lines": ("INT", {
+                    "default": 0, "min": 0, "max": 40, "step": 1,
+                    "tooltip": "Editor only: 0 lets each cell grow with its own text, "
+                               "N makes every cell N lines tall.",
+                }),
+                **{
+                    f"text_{i}": ("STRING", {"default": "", "multiline": True})
+                    for i in range(1, cls.MAX + 1)
+                },
             },
         }
 
@@ -182,7 +189,8 @@ class PromptParagraphs:
         return SEPARATOR_PRESETS.get(separator, "\n\n")
 
     def build(self, paragraphs, separator, custom_separator, skip_empty, strip,
-              comment_prefix, **cells):
+              comment_prefix, cell_lines=0, **cells):
+        # cell_lines only sizes the cells in the editor; nothing to do here
         count = max(1, min(int(paragraphs), self.MAX))
         prefix = comment_prefix.strip()
 

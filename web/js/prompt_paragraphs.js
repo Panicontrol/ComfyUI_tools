@@ -1,65 +1,190 @@
-// Show only the cells the "Prompt Paragraphs (tools)" node actually uses.
+// Editor-side behaviour for "Prompt Paragraphs (tools)":
 //
-// Every cell (text_1 .. text_N) is declared on the Python side, so the node
-// works with this script missing or broken -- it just shows all of its cells.
-// Hiding is cosmetic: the values stay in the widgets, which is why raising the
-// paragraph count again brings the text back.
+//   * cells above the paragraph count are hidden (widget.hidden, the facade
+//     over the frontend's widget visibility component)
+//   * every visible cell is given a fixed height that follows its own text,
+//     or a fixed line count when the cell_lines widget is set
+//
+// Both are cosmetic. The cells are declared server side, so the node keeps
+// working with this script missing, and hidden cells keep their text.
 
 import { app } from "../../scripts/app.js";
 
 const NODE_NAME = "ToolsPromptParagraphs";
-const HIDDEN_TYPE = "converted-widget";
+const CELL = /^text_(\d+)$/;
 
-function isCell(widget) {
-    return /^text_\d+$/.test(widget?.name ?? "");
-}
+const MIN_LINES = 2;       // a cell never collapses below this
+const MAX_AUTO_LINES = 20; // past this a growing cell scrolls instead
+const FALLBACK_LINE_HEIGHT = 20;
+const WIDGET_CHROME = 4;   // the layout adds 4px to every fixed-height widget
 
 function cellIndex(widget) {
-    return parseInt(widget.name.slice("text_".length), 10);
+    const match = CELL.exec(widget?.name ?? "");
+    return match ? Number(match[1]) : 0;
 }
 
-function setVisible(widget, visible) {
-    if (widget.origType === undefined) {
-        widget.origType = widget.type;
-        widget.origComputeSize = widget.computeSize;
+function textareaOf(widget) {
+    const element = widget?.element ?? widget?.inputEl ?? null;
+    if (!element) {
+        return null;
+    }
+    return element.tagName === "TEXTAREA" ? element : element.querySelector?.("textarea") ?? null;
+}
+
+function widgetValue(node, name, fallback) {
+    const widget = node.widgets?.find((w) => w.name === name);
+    const value = Number(widget?.value);
+    return Number.isFinite(value) ? value : fallback;
+}
+
+/** Height in pixels the textarea needs for `lines` lines, or for its text. */
+function contentHeight(element, lines) {
+    const style = getComputedStyle(element);
+    const lineHeight = parseFloat(style.lineHeight) || FALLBACK_LINE_HEIGHT;
+    const borders = (parseFloat(style.borderTopWidth) || 0) + (parseFloat(style.borderBottomWidth) || 0);
+    const padding = (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0);
+
+    if (lines > 0) {
+        return lines * lineHeight + padding + borders;
     }
 
-    widget.type = visible ? widget.origType : HIDDEN_TYPE;
-    widget.computeSize = visible ? widget.origComputeSize : () => [0, -4];
-    // newer frontends drive DOM widgets through this flag
-    widget.hidden = !visible;
+    // scrollHeight only reports the text height while the element is not
+    // already stretched to it, so collapse it for the measurement
+    const previous = element.style.height;
+    element.style.height = "0px";
+    const text = element.scrollHeight + borders;
+    element.style.height = previous;
 
+    const min = MIN_LINES * lineHeight + padding + borders;
+    const max = MAX_AUTO_LINES * lineHeight + padding + borders;
+    return Math.min(Math.max(text, min), max);
+}
+
+function sizeCell(node, widget, lines) {
+    const element = textareaOf(widget);
+    if (!element) {
+        return false;
+    }
+
+    // the frontend gives the element (widget height - 2 * margin), so the
+    // widget has to ask for that much more than the text needs
+    const margin = widget.margin ?? 10;
+    const height = Math.round(contentHeight(element, lines)) + 2 * margin - WIDGET_CHROME;
+    if (widget.toolsHeight === height) {
+        return false;
+    }
+
+    widget.toolsHeight = height;
+    widget.computeSize = () => [0, height];
+    return true;
+}
+
+function setHidden(widget, hidden) {
+    if (widget.hidden === hidden) {
+        return false;
+    }
+
+    widget.hidden = hidden;
+    if (hidden) {
+        widget.computeSize = () => [0, -WIDGET_CHROME];
+        widget.toolsHeight = undefined;
+    }
+
+    // older frontends that do not act on widget.hidden
     const element = widget.element ?? widget.inputEl;
     if (element?.style) {
-        element.style.display = visible ? "" : "none";
+        element.style.display = hidden ? "none" : "";
     }
+    return true;
 }
 
-function applyCount(node) {
-    const counter = node.widgets?.find((w) => w.name === "paragraphs");
-    if (!counter) {
+function apply(node) {
+    if (!node.widgets?.length) {
         return;
     }
 
-    const count = Math.max(1, Number(counter.value) || 1);
+    const count = Math.max(1, widgetValue(node, "paragraphs", 1));
+    const lines = Math.max(0, widgetValue(node, "cell_lines", 0));
+
     let changed = false;
+    let pending = false;
     for (const widget of node.widgets) {
-        if (!isCell(widget)) {
+        const index = cellIndex(widget);
+        if (!index) {
             continue;
         }
-        const visible = cellIndex(widget) <= count;
-        if (widget.hidden === !visible) {
-            continue;  // already in the right state
+        const hidden = index > count;
+        changed = setHidden(widget, hidden) || changed;
+        if (!hidden) {
+            changed = sizeCell(node, widget, lines) || changed;
+            pending = pending || !textareaOf(widget);
         }
-        setVisible(widget, visible);
-        changed = true;
     }
 
-    if (changed) {
-        const size = node.computeSize();
-        node.setSize([Math.max(node.size[0], size[0]), size[1]]);
-        node.graph?.setDirtyCanvas(true, true);
+    if (pending && (node.toolsRetries ?? 0) < 10) {
+        // the DOM widgets are not in the document yet (a freshly loaded
+        // workflow); measure again on the next frame
+        node.toolsRetries = (node.toolsRetries ?? 0) + 1;
+        schedule(node);
+    } else {
+        node.toolsRetries = 0;
     }
+
+    if (!changed) {
+        return;
+    }
+
+    const size = node.computeSize();
+    node.setSize([Math.max(node.size[0], size[0]), size[1]]);
+    node.graph?.setDirtyCanvas(true, true);
+}
+
+function schedule(node) {
+    if (node.toolsPending) {
+        return;
+    }
+    node.toolsPending = true;
+    requestAnimationFrame(() => {
+        node.toolsPending = false;
+        apply(node);
+    });
+}
+
+/** Re-measure a cell while it is typed in, and when the node is re-laid out. */
+function watch(node) {
+    for (const widget of node.widgets ?? []) {
+        if (!cellIndex(widget)) {
+            continue;
+        }
+        const element = textareaOf(widget);
+        if (!element || element.dataset.toolsWatched === "1") {
+            continue;
+        }
+        element.dataset.toolsWatched = "1";
+        element.addEventListener("input", () => schedule(node));
+    }
+}
+
+function follow(node, name) {
+    const widget = node.widgets?.find((w) => w.name === name);
+    if (!widget || widget.toolsFollowed) {
+        return;
+    }
+    widget.toolsFollowed = true;
+
+    const callback = widget.callback;
+    widget.callback = (...args) => {
+        const value = callback?.apply(widget, args);
+        schedule(node);
+        return value;
+    };
+}
+
+function attach(node) {
+    follow(node, "paragraphs");
+    follow(node, "cell_lines");
+    watch(node);
+    schedule(node);
 }
 
 app.registerExtension({
@@ -72,23 +197,25 @@ app.registerExtension({
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             const result = onNodeCreated?.apply(this, arguments);
-            const counter = this.widgets?.find((w) => w.name === "paragraphs");
-            if (counter) {
-                const callback = counter.callback;
-                counter.callback = (...args) => {
-                    const value = callback?.apply(counter, args);
-                    applyCount(this);
-                    return value;
-                };
-            }
-            requestAnimationFrame(() => applyCount(this));
+            attach(this);
             return result;
         };
 
         const onConfigure = nodeType.prototype.onConfigure;
         nodeType.prototype.onConfigure = function () {
             const result = onConfigure?.apply(this, arguments);
-            requestAnimationFrame(() => applyCount(this));
+            attach(this);
+            return result;
+        };
+
+        // a narrower node wraps the text differently, so re-measure on resize
+        const onResize = nodeType.prototype.onResize;
+        nodeType.prototype.onResize = function () {
+            const result = onResize?.apply(this, arguments);
+            if (this.toolsWidth !== this.size[0]) {
+                this.toolsWidth = this.size[0];
+                schedule(this);
+            }
             return result;
         };
     },
