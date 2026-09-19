@@ -104,8 +104,11 @@ the number of paragraphs that actually made it in.
 Any module whose name ends with `_nodes` is discovered and merged automatically by
 `comfyui_tools/__init__.py`; duplicate node ids raise on load.
 
-Browser-side scripts live in `web/js/` (served through `WEB_DIRECTORY`). Keep them
-cosmetic: every node must still work with the script missing.
+Browser-side scripts live in `web/`, which `WEB_DIRECTORY` serves at
+`/extensions/ComfyUI_tools/`. Keep them in that folder's root — a script one
+level deeper resolves `../../scripts/app.js` to `/extensions/scripts/app.js`
+and never loads — and keep them cosmetic: every node must still work with the
+script missing.
 
 ## Tests
 
