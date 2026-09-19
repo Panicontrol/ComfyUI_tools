@@ -68,6 +68,19 @@ H3 audio VAE runs at, so LanPaint never has to resample (that path needs
 | **Text Concat** | Join up to four text inputs with a delimiter, skipping empty ones (`\n` and `\t` work in the delimiter). |
 | **Text Template** | Fill `{a}`, `{b}`, `{c}` placeholders in a multiline template. |
 | **Clean Prompt** | Collapse whitespace, drop empty and duplicate tags, optionally lowercase; also returns the tag count. |
+| **Prompt Paragraphs** | Write a prompt as separate paragraphs, one editable cell each, and get a single `STRING` out — one node in place of a chain of text nodes feeding String Concatenate. |
+
+**Prompt Paragraphs** has 12 cells; the `paragraphs` widget sets how many are in
+use, and a small frontend script hides the rest. Hiding is cosmetic — the text
+stays in the widget, so lowering the count and raising it again brings the
+paragraph back. Cells also accept `STRING` links, so a shared paragraph can come
+from another node.
+
+Other widgets: `separator` (blank line, new line, space, comma, none, custom —
+`\n` and `\t` work in `custom_separator`), `skip_empty`, `strip`, and
+`comment_prefix` (default `//`) which mutes any cell that starts with it — handy
+for parking a paragraph while you iterate. Outputs the joined `text` and `used`,
+the number of paragraphs that actually made it in.
 
 ### tools/logic
 
@@ -85,6 +98,9 @@ H3 audio VAE runs at, so LanPaint never has to resample (that path needs
 
 Any module whose name ends with `_nodes` is discovered and merged automatically by
 `comfyui_tools/__init__.py`; duplicate node ids raise on load.
+
+Browser-side scripts live in `web/js/` (served through `WEB_DIRECTORY`). Keep them
+cosmetic: every node must still work with the script missing.
 
 ## Tests
 
