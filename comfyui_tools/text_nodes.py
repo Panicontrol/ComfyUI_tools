@@ -163,16 +163,13 @@ class PromptParagraphs:
                     "tooltip": "A cell starting with this is left out -- a way to mute a paragraph. Empty disables it.",
                 }),
             },
+            # Widget values are restored by position in saved workflows, so a
+            # new widget may only be appended after the cells, never inserted
+            # among them -- see tests/test_prompt_paragraphs.py. Editor-only
+            # settings belong in node properties instead (web/).
             "optional": {
-                "cell_lines": ("INT", {
-                    "default": 0, "min": 0, "max": 40, "step": 1,
-                    "tooltip": "Editor only: 0 lets each cell grow with its own text, "
-                               "N makes every cell N lines tall.",
-                }),
-                **{
-                    f"text_{i}": ("STRING", {"default": "", "multiline": True})
-                    for i in range(1, cls.MAX + 1)
-                },
+                f"text_{i}": ("STRING", {"default": "", "multiline": True})
+                for i in range(1, cls.MAX + 1)
             },
         }
 
@@ -189,8 +186,7 @@ class PromptParagraphs:
         return SEPARATOR_PRESETS.get(separator, "\n\n")
 
     def build(self, paragraphs, separator, custom_separator, skip_empty, strip,
-              comment_prefix, cell_lines=0, **cells):
-        # cell_lines only sizes the cells in the editor; nothing to do here
+              comment_prefix, **cells):
         count = max(1, min(int(paragraphs), self.MAX))
         prefix = comment_prefix.strip()
 

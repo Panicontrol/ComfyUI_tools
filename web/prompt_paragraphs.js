@@ -3,7 +3,8 @@
 //   * cells above the paragraph count are hidden (widget.hidden, the facade
 //     over the frontend's widget visibility component)
 //   * every visible cell is given a fixed height that follows its own text,
-//     or a fixed line count when the cell_lines widget is set
+//     or a fixed line count when the cellLines node property is set
+//     (right click the node -> "Cell height")
 //
 // Both are cosmetic. The cells are declared server side, so the node keeps
 // working with this script missing, and hidden cells keep their text.
@@ -35,6 +36,18 @@ function widgetValue(node, name, fallback) {
     const widget = node.widgets?.find((w) => w.name === name);
     const value = Number(widget?.value);
     return Number.isFinite(value) ? value : fallback;
+}
+
+/**
+ * Lines per cell, 0 meaning "fit the text".
+ *
+ * This lives in node.properties rather than in a widget: widget values are
+ * restored by position from a saved workflow, so adding a widget among the
+ * existing ones shifts every value after it.
+ */
+function cellLines(node) {
+    const value = Number(node.properties?.cellLines);
+    return Number.isFinite(value) && value > 0 ? Math.min(Math.round(value), 40) : 0;
 }
 
 /** Height in pixels the textarea needs for `lines` lines, or for its text. */
@@ -104,7 +117,7 @@ function apply(node) {
     }
 
     const count = Math.max(1, widgetValue(node, "paragraphs", 1));
-    const lines = Math.max(0, widgetValue(node, "cell_lines", 0));
+    const lines = cellLines(node);
 
     let changed = false;
     let pending = false;
@@ -181,8 +194,10 @@ function follow(node, name) {
 }
 
 function attach(node) {
+    if (node.properties.cellLines === undefined) {
+        node.properties.cellLines = 0;
+    }
     follow(node, "paragraphs");
-    follow(node, "cell_lines");
     watch(node);
     schedule(node);
 }
@@ -193,6 +208,35 @@ app.registerExtension({
         if (nodeData.name !== NODE_NAME) {
             return;
         }
+
+        const getExtraMenuOptions = nodeType.prototype.getExtraMenuOptions;
+        nodeType.prototype.getExtraMenuOptions = function (canvas, options) {
+            const result = getExtraMenuOptions?.apply(this, arguments);
+            const node = this;
+            options.push({
+                content: `Cell height (${cellLines(node) || "fit text"})`,
+                callback: () => {
+                    canvas.prompt(
+                        "Lines per cell (0 = fit the text)",
+                        cellLines(node),
+                        (value) => {
+                            const lines = Number(value);
+                            node.properties.cellLines = Number.isFinite(lines)
+                                ? Math.max(0, Math.min(Math.round(lines), 40))
+                                : 0;
+                            for (const widget of node.widgets ?? []) {
+                                if (cellIndex(widget)) {
+                                    widget.toolsHeight = undefined;
+                                }
+                            }
+                            schedule(node);
+                        },
+                        {},
+                    );
+                },
+            });
+            return result;
+        };
 
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {

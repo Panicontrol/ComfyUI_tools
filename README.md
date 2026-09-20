@@ -77,9 +77,11 @@ paragraph back. Cells also accept `STRING` links, so a shared paragraph can come
 from another node.
 
 Cells size themselves to their own text: a one-line paragraph gets a one-line
-cell, a long one grows up to 20 lines and then scrolls. `cell_lines` overrides
-that — set it to N and every cell becomes exactly N lines tall (0 = grow with
-the text). It is an editor-only widget; the Python side ignores it.
+cell, a long one grows up to 20 lines and then scrolls. To make every cell the
+same height instead, right click the node → **Cell height** and give it a line
+count (0 goes back to fitting the text). That setting is stored as a node
+property, not a widget, so it travels with the workflow without disturbing the
+cells.
 
 Other widgets: `separator` (blank line, new line, space, comma, none, custom —
 `\n` and `\t` work in `custom_separator`), `skip_empty`, `strip`, and
@@ -109,6 +111,11 @@ Browser-side scripts live in `web/`, which `WEB_DIRECTORY` serves at
 level deeper resolves `../../scripts/app.js` to `/extensions/scripts/app.js`
 and never loads — and keep them cosmetic: every node must still work with the
 script missing.
+
+Widget order is part of a node's contract: ComfyUI restores widget values by
+position, so a widget added among the existing ones shifts every value after it
+in workflows people have already saved. Append new widgets after the old ones,
+and keep editor-only settings in node properties instead.
 
 ## Tests
 

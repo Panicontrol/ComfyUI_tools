@@ -1,5 +1,3 @@
-import inspect
-
 import pytest
 
 from comfyui_tools.text_nodes import MAX_PARAGRAPHS, PromptParagraphs, unescape
@@ -14,9 +12,9 @@ def build(**kwargs):
         "strip": True,
         "comment_prefix": "//",
     }
-    cells = {key: kwargs.pop(key) for key in list(kwargs) if key.startswith("text_")}
+    extra = {key: kwargs.pop(key) for key in list(kwargs) if key not in params}
     params.update(kwargs)
-    return PromptParagraphs().build(**params, **cells)
+    return PromptParagraphs().build(**params, **extra)
 
 
 def test_every_cell_is_declared_and_optional():
@@ -27,16 +25,34 @@ def test_every_cell_is_declared_and_optional():
     assert types["required"]["paragraphs"][1]["max"] == MAX_PARAGRAPHS
 
 
-def test_cell_lines_is_an_editor_only_widget():
-    # declared so it is saved with the workflow, ignored when building the text
-    assert "cell_lines" in PromptParagraphs.INPUT_TYPES()["optional"]
+# ComfyUI restores widget values by position, so inserting a widget among the
+# existing ones shifts every value after it in already-saved workflows (the
+# first paragraph lands in the new widget). New widgets may only be appended
+# after the cells; editor-only settings belong in node properties instead.
+EXPECTED_WIDGET_ORDER = [
+    "paragraphs",
+    "separator",
+    "custom_separator",
+    "skip_empty",
+    "strip",
+    "comment_prefix",
+    *[f"text_{i}" for i in range(1, MAX_PARAGRAPHS + 1)],
+]
+
+
+def test_widget_order_is_stable_for_saved_workflows():
+    types = PromptParagraphs.INPUT_TYPES()
+    assert list(types["required"]) + list(types["optional"]) == EXPECTED_WIDGET_ORDER
+
+
+def test_editor_only_settings_are_not_node_inputs():
+    types = PromptParagraphs.INPUT_TYPES()
+    assert "cell_lines" not in types["required"]
+    assert "cell_lines" not in types["optional"]
+
+
+def test_a_stray_input_from_an_older_workflow_is_ignored():
     assert build(cell_lines=6, text_1="a", text_2="b") == build(text_1="a", text_2="b")
-
-
-def test_cell_lines_defaults_when_an_old_workflow_omits_it():
-    default = inspect.signature(PromptParagraphs.build).parameters["cell_lines"].default
-    assert default == 0
-    assert build(text_1="a") == ("a", 1)
 
 
 def test_joins_the_cells_with_a_blank_line():
