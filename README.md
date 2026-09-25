@@ -23,6 +23,18 @@ There are no extra dependencies — the pack only uses `torch`, which ComfyUI al
 | **Image Resize** | Resize by longest side, shortest side, megapixels or explicit width/height. Keeps aspect ratio, snaps to a multiple of N (8 by default) and also outputs the resulting width/height as `INT`. |
 | **Image Pad To Ratio** | Pad an image out to a target aspect ratio with a chosen color and position. Returns the padded image plus a mask of the added area — ready to feed an outpainting pass. |
 | **Image Info** | Width, height, batch size, aspect ratio and a printable summary of an image batch. |
+| **Load Image Sequence** | Load a folder of images — a rendered PNG sequence — as one `IMAGE` batch, with the alpha channel as `MASK`s. |
+
+**Load Image Sequence** takes a folder path (absolute, `~/…`, or relative to
+ComfyUI's input folder) and a `pattern` of comma separated globs (`*.png` by
+default, `frame_*.png, render_*.png` also works). Frames are ordered the way a
+sequence reads — `frame_2` before `frame_10` — or by modification time or size,
+optionally reversed. `start_index`, `step` and `count` slice a long render into
+pieces (every 2nd frame, the next 16, …). Since a batch needs one size, a frame
+that does not match the first one is an error unless `on_size_mismatch` is set
+to `resize` or `skip`. Outputs the batch, the masks, the frame `count` and the
+`filenames` that went in, and it re-runs when the folder's contents change, not
+just when its path does.
 
 ### tools/mask
 
