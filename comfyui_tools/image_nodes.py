@@ -445,12 +445,77 @@ class ExtendSequence:
         return (out_images, out_masks, len(indices), ",".join(str(i) for i in indices))
 
 
+class RestoreSequenceLength:
+    """Cut a generated batch back to the length of the sequence it came from.
+
+    The counterpart of Extend Sequence: every one of its modes keeps the
+    original frames first and appends the padding after them, so the first N
+    frames of the generated batch are the original timeline. Connect the
+    pre-extension batch as ``original`` and N is its frame count; otherwise
+    ``length`` sets it. A batch that is already that short or shorter passes
+    through unchanged -- no frames are invented.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "The generated (extended) batch."}),
+                "length": ("INT", {
+                    "default": 0, "min": 0, "max": 100000, "step": 1,
+                    "tooltip": "Frames to keep. Ignored when original is connected.",
+                }),
+            },
+            "optional": {
+                "original": ("IMAGE", {
+                    "tooltip": "The batch before Extend Sequence; its frame count is the length to restore.",
+                }),
+                "masks": ("MASK", {"tooltip": "Cut to the same length as the images."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "INT")
+    RETURN_NAMES = ("images", "masks", "count")
+    FUNCTION = "restore"
+    CATEGORY = f"{CATEGORY}/image"
+    DESCRIPTION = ("Trim a generated batch back to the original sequence length, "
+                   "undoing Extend Sequence before saving.")
+
+    def restore(self, images, length, original=None, masks=None):
+        target = int(original.shape[0]) if original is not None else int(length)
+        if target < 1:
+            raise ValueError("connect the original batch or set length to the frames to keep")
+
+        frames = int(images.shape[0])
+        keep = min(target, frames)
+        out_images = images[:keep]
+
+        if masks is None:
+            out_masks = torch.zeros(
+                (keep, images.shape[1], images.shape[2]), dtype=torch.float32, device=images.device
+            )
+        else:
+            if masks.ndim == 2:
+                masks = masks.unsqueeze(0)
+            if masks.shape[0] == 1:
+                out_masks = masks.expand(keep, -1, -1).contiguous()
+            elif masks.shape[0] >= keep:
+                out_masks = masks[:keep]
+            else:
+                raise ValueError(
+                    f"the masks have {masks.shape[0]} frames, fewer than the {keep} being kept"
+                )
+
+        return (out_images, out_masks, keep)
+
+
 NODE_CLASS_MAPPINGS = {
     "ToolsImageResize": ImageResize,
     "ToolsImagePadToRatio": ImagePadToRatio,
     "ToolsImageInfo": ImageInfo,
     "ToolsLoadImageSequence": LoadImageSequence,
     "ToolsExtendSequence": ExtendSequence,
+    "ToolsRestoreSequenceLength": RestoreSequenceLength,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -459,4 +524,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ToolsImageInfo": "Image Info (tools)",
     "ToolsLoadImageSequence": "Load Image Sequence (tools)",
     "ToolsExtendSequence": "Extend Sequence (tools)",
+    "ToolsRestoreSequenceLength": "Restore Sequence Length (tools)",
 }
