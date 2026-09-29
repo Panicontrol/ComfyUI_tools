@@ -347,11 +347,110 @@ class LoadImageSequence:
         return (torch.cat(frames), torch.cat(masks), len(loaded), "\n".join(loaded))
 
 
+def extend_indices(frames, length, mode, trim_longer=False):
+    """Source frame for every output frame when stretching a sequence to ``length``.
+
+    ``mirror`` plays the sequence forward, then backward, then forward again
+    (0 1 2 1 0 1 ...) without repeating the frame it turns on, so the motion
+    has no stutter at the turn. ``loop`` starts over (0 1 2 0 1 2 ...) and
+    ``hold_last`` freezes on the final frame.
+    """
+    if frames < 1:
+        raise ValueError("the sequence has no frames to extend")
+    if length < 1:
+        raise ValueError("the target length must be at least 1")
+
+    if length <= frames:
+        return list(range(length if trim_longer else frames))
+
+    if mode == "loop":
+        return [i % frames for i in range(length)]
+    if mode == "hold_last":
+        return list(range(frames)) + [frames - 1] * (length - frames)
+
+    # mirror
+    if frames == 1:
+        return [0] * length
+    period = 2 * frames - 2
+    indices = []
+    for i in range(length):
+        k = i % period
+        indices.append(k if k < frames else period - k)
+    return indices
+
+
+class ExtendSequence:
+    """Stretch an image batch to a minimum length by mirroring or looping it.
+
+    Built for models with a minimum clip length: a 98-frame sequence that has
+    to be 124 frames plays forward, then mirrors back for the missing 26. A
+    batch that is already long enough passes through untouched unless
+    ``trim_longer`` cuts it to exactly ``length``.
+    """
+
+    MODES = ["mirror", "loop", "hold_last"]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "length": ("INT", {
+                    "default": 124, "min": 1, "max": 100000, "step": 1,
+                    "tooltip": "Frames the batch must have. Shorter batches are extended to it.",
+                }),
+                "mode": (cls.MODES, {
+                    "default": "mirror",
+                    "tooltip": "mirror: 0 1 2 1 0 1 ...  loop: 0 1 2 0 1 2 ...  hold_last: 0 1 2 2 2 ...",
+                }),
+                "trim_longer": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Off: a batch already longer than length is kept whole. "
+                               "On: it is cut to exactly length frames.",
+                }),
+            },
+            "optional": {
+                "masks": ("MASK", {"tooltip": "Extended with the same frame order as the images."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "INT", "STRING")
+    RETURN_NAMES = ("images", "masks", "count", "frame_order")
+    FUNCTION = "extend"
+    CATEGORY = f"{CATEGORY}/image"
+    DESCRIPTION = ("Extend an image batch to a minimum length by mirroring (ping-pong), "
+                   "looping or holding the last frame, then trim to that length.")
+
+    def extend(self, images, length, mode, trim_longer, masks=None):
+        frames = int(images.shape[0])
+        indices = extend_indices(frames, int(length), mode, trim_longer)
+        order = torch.tensor(indices, dtype=torch.long, device=images.device)
+
+        if masks is None:
+            masks = torch.zeros(
+                (frames, images.shape[1], images.shape[2]), dtype=torch.float32, device=images.device
+            )
+        elif masks.ndim == 2:  # a single [H, W] mask
+            masks = masks.unsqueeze(0)
+
+        if masks.shape[0] == 1 and frames > 1:
+            masks = masks.expand(frames, -1, -1)
+        elif masks.shape[0] != frames:
+            raise ValueError(
+                f"the masks have {masks.shape[0]} frames but the images have {frames}"
+            )
+
+        out_images = images.index_select(0, order)
+        out_masks = masks.index_select(0, order.to(masks.device)).contiguous()
+        return (out_images, out_masks, len(indices), ",".join(str(i) for i in indices))
+
+
 NODE_CLASS_MAPPINGS = {
     "ToolsImageResize": ImageResize,
     "ToolsImagePadToRatio": ImagePadToRatio,
     "ToolsImageInfo": ImageInfo,
     "ToolsLoadImageSequence": LoadImageSequence,
+    "ToolsExtendSequence": ExtendSequence,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -359,4 +458,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ToolsImagePadToRatio": "Image Pad To Ratio (tools)",
     "ToolsImageInfo": "Image Info (tools)",
     "ToolsLoadImageSequence": "Load Image Sequence (tools)",
+    "ToolsExtendSequence": "Extend Sequence (tools)",
 }

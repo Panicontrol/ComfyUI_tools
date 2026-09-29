@@ -24,6 +24,7 @@ There are no extra dependencies — the pack only uses `torch`, which ComfyUI al
 | **Image Pad To Ratio** | Pad an image out to a target aspect ratio with a chosen color and position. Returns the padded image plus a mask of the added area — ready to feed an outpainting pass. |
 | **Image Info** | Width, height, batch size, aspect ratio and a printable summary of an image batch. |
 | **Load Image Sequence** | Load a folder of images — a rendered PNG sequence — as one `IMAGE` batch, with the alpha channel as `MASK`s. |
+| **Extend Sequence** | Stretch a batch to a minimum length by mirroring, looping or holding the last frame — e.g. a 98-frame render to the 124 frames a model requires. |
 
 **Load Image Sequence** takes a folder path (absolute, `~/…`, or relative to
 ComfyUI's input folder) and a `pattern` of comma separated globs (`*.png` by
@@ -35,6 +36,15 @@ that does not match the first one is an error unless `on_size_mismatch` is set
 to `resize` or `skip`. Outputs the batch, the masks, the frame `count` and the
 `filenames` that went in, and it re-runs when the folder's contents change, not
 just when its path does.
+
+**Extend Sequence** takes any `IMAGE` batch (and optionally its `MASK`s) and a
+target `length`. `mirror` plays the frames forward and then back without
+repeating the frame it turns on (`0 1 2 3 2 1 0 1 …`), so 98 frames extended to
+124 are frames 0–97 followed by 96 down to 71. `loop` starts over from frame 0
+and `hold_last` freezes on the final frame. A batch that is already long enough
+passes through whole unless `trim_longer` cuts it to exactly `length`. Besides
+the batch and masks it outputs the `count` and `frame_order`, the source index
+of every output frame.
 
 ### tools/mask
 
