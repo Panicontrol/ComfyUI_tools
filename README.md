@@ -84,6 +84,13 @@ Both silence nodes default to a 32 kHz sample rate, which is what the MiniMax
 H3 audio VAE runs at, so LanPaint never has to resample (that path needs
 `torchaudio`).
 
+### tools/latent
+
+| Node | What it does |
+| --- | --- |
+| **Save Latent To** | Save a `LATENT` to any folder (created if missing) as `<prefix>_00001.latent`, `_00002`, … Keeps everything in the latent: MiniMax H3 video+audio `NestedTensor`s, `noise_mask`, dtype. Also outputs the saved `path`. |
+| **Load Latent From** | Load a `.latent` file from any path — absolute, or relative to ComfyUI's output or input folder — and rebuild the latent exactly. Also reads files saved by ComfyUI's own Save Latent. |
+
 ### tools/text
 
 | Node | What it does |
