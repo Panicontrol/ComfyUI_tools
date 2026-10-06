@@ -1,3 +1,6 @@
+import zipfile
+
+import av
 import pytest
 import torch
 
@@ -11,18 +14,29 @@ def save(images, folder, **kwargs):
     return SaveImageSequence().save(images, str(folder), **params)["result"]
 
 
-def test_layout_and_round_trip_with_masks(tmp_path):
-    images, masks = torch.rand(2, 6, 8, 3), torch.rand(2, 6, 8)
-    folder, version, count = save(images, tmp_path, masks=masks)
-    assert folder == str(tmp_path / "depth_v004") and (version, count) == (4, 2)
+def test_video_sequence_and_zip_layout(tmp_path):
+    images, masks = torch.rand(3, 6, 9, 3), torch.rand(3, 6, 9)  # odd width on purpose
+    folder, version, count, video = save(images, tmp_path, masks=masks, need_zip=True)
+    assert video == str(tmp_path / "depth_v004.mp4")
+    assert folder == str(tmp_path / "depth_v004") and (version, count) == (4, 3)
+
+    with av.open(video) as container:
+        assert sum(1 for _ in container.decode(video=0)) == 3
+    with zipfile.ZipFile(tmp_path / "depth_v004.zip") as archive:
+        assert archive.namelist()[0] == "depth_v004/depth_v004.01001.png"
 
     loaded, loaded_masks, _, names = LoadImageSequence().load(folder, "*.png", "name", False, 0, 1, 0, "error")
-    assert names.splitlines() == ["depth_v004.01001.png", "depth_v004.01002.png"]
+    assert names.splitlines()[0] == "depth_v004.01001.png"
     assert torch.allclose(loaded, images, atol=1 / 255)
     assert torch.allclose(loaded_masks, masks, atol=1 / 255)
 
 
-def test_existing_frames_are_kept_unless_overwrite(tmp_path):
+def test_video_only(tmp_path):
+    save(torch.rand(2, 4, 4, 3), tmp_path, need_save=False)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["depth_v004.mp4"]
+
+
+def test_existing_files_are_kept_unless_overwrite(tmp_path):
     images = torch.rand(1, 4, 4, 3)
     save(images, tmp_path)
     with pytest.raises(ValueError, match="raise number_version"):

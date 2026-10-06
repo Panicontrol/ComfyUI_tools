@@ -522,13 +522,39 @@ def output_directory(directory):
         return os.path.abspath(path)
 
 
+def write_mp4(path, pixels, frame_rate):
+    """Encode ``[N, H, W, 3]`` uint8 frames as an H.264 mp4."""
+    import av  # ships with ComfyUI
+    from fractions import Fraction
+
+    height, width = pixels.shape[1], pixels.shape[2]
+    pad_h, pad_w = height % 2, width % 2  # yuv420p needs even sides
+    with av.open(path, mode="w") as container:
+        stream = container.add_stream("h264", rate=Fraction(round(frame_rate * 1000), 1000))
+        stream.width = width + pad_w
+        stream.height = height + pad_h
+        stream.pix_fmt = "yuv420p"
+        stream.options = {"crf": "18"}
+        for frame in pixels:
+            if pad_h or pad_w:
+                frame = np.pad(frame, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+
+
 class SaveImageSequence:
-    """Save a batch as a PNG sequence: <save_folder>/<name>_v004/<name>_v004.01001.png.
+    """Save a render as video, plus an optional PNG sequence and zip of it.
+
+    In <save_folder>, for new_folder = depth and version 4:
+      depth_v004.mp4                        always
+      depth_v004.zip                        need_zip: the frames, zipped
+      depth_v004/depth_v004.01001.png ...   need_save: the frames
 
     number_version has ComfyUI's "control after generate" switch, set to
-    increment, so every run lands in a new version folder. Masks are written
-    as the alpha channel (1 - mask), which Load Image Sequence reads back as
-    masks.
+    increment, so every run is a new version. Masks go into the PNGs' alpha
+    channel (1 - mask), which Load Image Sequence reads back as masks.
     """
 
     @classmethod
@@ -538,11 +564,11 @@ class SaveImageSequence:
                 "images": ("IMAGE",),
                 "save_folder": ("STRING", {
                     "default": "",
-                    "tooltip": "Project folder; the version folder is created inside it.",
+                    "tooltip": "Project folder: the video, zip and sequence folder are written here.",
                 }),
                 "new_folder": ("STRING", {
                     "default": "render",
-                    "tooltip": "Render name: gives depth_v004/depth_v004.01001.png.",
+                    "tooltip": "Render name: gives depth_v004.mp4 and depth_v004/depth_v004.01001.png.",
                 }),
                 "number_version": ("INT", {
                     "default": 1, "min": 0, "max": 999, "step": 1,
@@ -552,23 +578,39 @@ class SaveImageSequence:
                 "padding_frame_name": ("INT", {"default": 5, "min": 1, "max": 10, "step": 1}),
                 "overwrite": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Off: stop with an error instead of replacing frames that already exist.",
+                    "tooltip": "Off: stop with an error instead of replacing files that already exist.",
                 }),
             },
+            # appended after the original widgets so saved workflows keep their
+            # values in place; optional so those workflows still validate
             "optional": {
                 "masks": ("MASK", {"tooltip": "Saved as the PNG alpha channel."}),
+                "frame_rate": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 0.001}),
+                "need_save": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Also save the PNG sequence in <save_folder>/<name>_v###/.",
+                }),
+                "need_zip": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Also zip the PNG sequence next to the video as <name>_v###.zip.",
+                }),
             },
         }
 
-    RETURN_TYPES = ("STRING", "INT", "INT")
-    RETURN_NAMES = ("folder", "version", "count")
+    RETURN_TYPES = ("STRING", "INT", "INT", "STRING")
+    RETURN_NAMES = ("folder", "version", "count", "video")
     FUNCTION = "save"
     OUTPUT_NODE = True
     CATEGORY = f"{CATEGORY}/image"
-    DESCRIPTION = "Save images as a PNG sequence into <save_folder>/<name>_v###/, a new version per run."
+    DESCRIPTION = ("Save a render as <name>_v###.mp4 in the project folder, optionally with "
+                   "its PNG sequence and a zip of it; a new version per run.")
 
     def save(self, images, save_folder, new_folder, number_version, start_frame_index,
-             padding_frame_name, overwrite, masks=None):
+             padding_frame_name, overwrite, masks=None, frame_rate=24.0, need_save=True,
+             need_zip=False):
+        import io
+        import zipfile
+
         if Image is None:
             raise RuntimeError("this node needs Pillow and numpy (both ship with ComfyUI)")
         if not str(save_folder).strip():
@@ -576,18 +618,27 @@ class SaveImageSequence:
 
         name = str(new_folder).strip()
         versioned = f"{name}_v{number_version:03d}" if name else f"v{number_version:03d}"
-        folder = os.path.join(output_directory(save_folder), versioned)
+        project = output_directory(save_folder)
+        folder = os.path.join(project, versioned)
+        video_path = os.path.join(project, f"{versioned}.mp4")
+        zip_path = os.path.join(project, f"{versioned}.zip")
 
         frames = int(images.shape[0])
-        paths = [
-            os.path.join(folder, f"{versioned}.{n:0{padding_frame_name}d}.png")
+        names = [
+            f"{versioned}.{n:0{padding_frame_name}d}.png"
             for n in range(start_frame_index, start_frame_index + frames)
         ]
+
+        targets = [video_path]
+        if need_zip:
+            targets.append(zip_path)
+        if need_save:
+            targets += [os.path.join(folder, n) for n in names]
         if not overwrite:
-            existing = [path for path in paths if os.path.exists(path)]
+            existing = [path for path in targets if os.path.exists(path)]
             if existing:
                 raise ValueError(
-                    f"{len(existing)} frame(s) already exist in {folder}; "
+                    f"{os.path.basename(existing[0])} already exists in {os.path.dirname(existing[0])}; "
                     "raise number_version or turn overwrite on"
                 )
 
@@ -600,17 +651,35 @@ class SaveImageSequence:
             alpha = (1.0 - resize_mask(masks, images.shape[2], images.shape[1])).clamp(0.0, 1.0)
             alpha = (alpha * 255.0).round().to(torch.uint8).cpu().numpy()
 
-        os.makedirs(folder, exist_ok=True)
+        os.makedirs(project, exist_ok=True)
         pixels = (images.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).cpu().numpy()
-        for index, path in enumerate(paths):
-            if alpha is None:
-                Image.fromarray(pixels[index], "RGB").save(path, compress_level=4)
-            else:
-                a = alpha[0 if alpha.shape[0] == 1 else index]
-                Image.fromarray(np.dstack([pixels[index], a]), "RGBA").save(path, compress_level=4)
 
-        return {"ui": {"text": [folder]}, "result": (folder, number_version, frames)}
+        if need_save or need_zip:
+            if need_save:
+                os.makedirs(folder, exist_ok=True)
+            archive = zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) if need_zip else None
+            try:
+                for index, filename in enumerate(names):
+                    if alpha is None:
+                        image = Image.fromarray(pixels[index], "RGB")
+                    else:
+                        a = alpha[0 if alpha.shape[0] == 1 else index]
+                        image = Image.fromarray(np.dstack([pixels[index], a]), "RGBA")
+                    buffer = io.BytesIO()
+                    image.save(buffer, format="PNG", compress_level=4)
+                    data = buffer.getvalue()
+                    if need_save:
+                        with open(os.path.join(folder, filename), "wb") as handle:
+                            handle.write(data)
+                    if archive is not None:  # PNG is already compressed: store
+                        archive.writestr(f"{versioned}/{filename}", data)
+            finally:
+                if archive is not None:
+                    archive.close()
 
+        write_mp4(video_path, pixels, float(frame_rate))
+
+        return {"ui": {"text": [video_path]}, "result": (folder, number_version, frames, video_path)}
 
 NODE_CLASS_MAPPINGS = {
     "ToolsImageResize": ImageResize,
