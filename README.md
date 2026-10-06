@@ -26,6 +26,7 @@ There are no extra dependencies — the pack only uses `torch`, which ComfyUI al
 | **Load Image Sequence** | Load a folder of images — a rendered PNG sequence — as one `IMAGE` batch, with the alpha channel as `MASK`s. |
 | **Extend Sequence** | Stretch a batch to a minimum length by mirroring, looping or holding the last frame — e.g. a 98-frame render to the 124 frames a model requires. |
 | **Restore Sequence Length** | The reverse of Extend Sequence: cut the generated batch back to the original frame count before saving. Connect the pre-extension batch as `original`, or set `length`. |
+| **Save Image Sequence** | Save a batch as a PNG sequence to `<save_folder>/<new_folder>_v004/<new_folder>_v004.01001.png`. `number_version` steps up every run (*control after generate* → `increment`); frames start at `start_frame_index` (1001) with `padding_frame_name` digits (5); masks go into the alpha channel; existing frames are kept unless `overwrite` is on. |
 
 **Load Image Sequence** takes a folder path (absolute, `~/…`, or relative to
 ComfyUI's input folder) and a `pattern` of comma separated globs (`*.png` by

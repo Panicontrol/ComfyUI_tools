@@ -509,6 +509,109 @@ class RestoreSequenceLength:
         return (out_images, out_masks, keep)
 
 
+def output_directory(directory):
+    """Absolute folder for saving: absolute, ~, or relative to ComfyUI's output folder."""
+    path = os.path.expanduser(str(directory).strip().strip('"'))
+    if os.path.isabs(path):
+        return path
+    try:
+        import folder_paths
+
+        return os.path.join(folder_paths.get_output_directory(), path)
+    except Exception:
+        return os.path.abspath(path)
+
+
+class SaveImageSequence:
+    """Save a batch as a PNG sequence: <save_folder>/<name>_v004/<name>_v004.01001.png.
+
+    number_version has ComfyUI's "control after generate" switch, set to
+    increment, so every run lands in a new version folder. Masks are written
+    as the alpha channel (1 - mask), which Load Image Sequence reads back as
+    masks.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "save_folder": ("STRING", {
+                    "default": "",
+                    "tooltip": "Project folder; the version folder is created inside it.",
+                }),
+                "new_folder": ("STRING", {
+                    "default": "render",
+                    "tooltip": "Render name: gives depth_v004/depth_v004.01001.png.",
+                }),
+                "number_version": ("INT", {
+                    "default": 1, "min": 0, "max": 999, "step": 1,
+                    "control_after_generate": "increment",
+                }),
+                "start_frame_index": ("INT", {"default": 1001, "min": 0, "max": 10000000, "step": 1}),
+                "padding_frame_name": ("INT", {"default": 5, "min": 1, "max": 10, "step": 1}),
+                "overwrite": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Off: stop with an error instead of replacing frames that already exist.",
+                }),
+            },
+            "optional": {
+                "masks": ("MASK", {"tooltip": "Saved as the PNG alpha channel."}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "INT", "INT")
+    RETURN_NAMES = ("folder", "version", "count")
+    FUNCTION = "save"
+    OUTPUT_NODE = True
+    CATEGORY = f"{CATEGORY}/image"
+    DESCRIPTION = "Save images as a PNG sequence into <save_folder>/<name>_v###/, a new version per run."
+
+    def save(self, images, save_folder, new_folder, number_version, start_frame_index,
+             padding_frame_name, overwrite, masks=None):
+        if Image is None:
+            raise RuntimeError("this node needs Pillow and numpy (both ship with ComfyUI)")
+        if not str(save_folder).strip():
+            raise ValueError("give the node a save_folder")
+
+        name = str(new_folder).strip()
+        versioned = f"{name}_v{number_version:03d}" if name else f"v{number_version:03d}"
+        folder = os.path.join(output_directory(save_folder), versioned)
+
+        frames = int(images.shape[0])
+        paths = [
+            os.path.join(folder, f"{versioned}.{n:0{padding_frame_name}d}.png")
+            for n in range(start_frame_index, start_frame_index + frames)
+        ]
+        if not overwrite:
+            existing = [path for path in paths if os.path.exists(path)]
+            if existing:
+                raise ValueError(
+                    f"{len(existing)} frame(s) already exist in {folder}; "
+                    "raise number_version or turn overwrite on"
+                )
+
+        alpha = None
+        if masks is not None:
+            if masks.ndim == 2:
+                masks = masks.unsqueeze(0)
+            if masks.shape[0] not in (1, frames):
+                raise ValueError(f"the masks have {masks.shape[0]} frames but the images have {frames}")
+            alpha = (1.0 - resize_mask(masks, images.shape[2], images.shape[1])).clamp(0.0, 1.0)
+            alpha = (alpha * 255.0).round().to(torch.uint8).cpu().numpy()
+
+        os.makedirs(folder, exist_ok=True)
+        pixels = (images.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).cpu().numpy()
+        for index, path in enumerate(paths):
+            if alpha is None:
+                Image.fromarray(pixels[index], "RGB").save(path, compress_level=4)
+            else:
+                a = alpha[0 if alpha.shape[0] == 1 else index]
+                Image.fromarray(np.dstack([pixels[index], a]), "RGBA").save(path, compress_level=4)
+
+        return {"ui": {"text": [folder]}, "result": (folder, number_version, frames)}
+
+
 NODE_CLASS_MAPPINGS = {
     "ToolsImageResize": ImageResize,
     "ToolsImagePadToRatio": ImagePadToRatio,
@@ -516,6 +619,7 @@ NODE_CLASS_MAPPINGS = {
     "ToolsLoadImageSequence": LoadImageSequence,
     "ToolsExtendSequence": ExtendSequence,
     "ToolsRestoreSequenceLength": RestoreSequenceLength,
+    "ToolsSaveImageSequence": SaveImageSequence,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -525,4 +629,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ToolsLoadImageSequence": "Load Image Sequence (tools)",
     "ToolsExtendSequence": "Extend Sequence (tools)",
     "ToolsRestoreSequenceLength": "Restore Sequence Length (tools)",
+    "ToolsSaveImageSequence": "Save Image Sequence (tools)",
 }
