@@ -96,14 +96,48 @@ class SeedRange:
         return tuple((seed + offset * i) % limit for i in range(4))
 
 
+class VersionCounter:
+    """A version number that goes up by one on every queued run.
+
+    Uses ComfyUI's own "control after generate" widget (the one next to a
+    seed), set to increment by default: the run uses the current value and
+    the widget then steps to the next one. Switch it to fixed to re-render a
+    version, or type a number to jump.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "version": ("INT", {
+                    "default": 1, "min": 0, "max": 999999, "step": 1,
+                    "control_after_generate": "increment",
+                }),
+                "prefix": ("STRING", {"default": "v"}),
+                "padding": ("INT", {"default": 3, "min": 0, "max": 10, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("INT", "STRING")
+    RETURN_NAMES = ("version", "label")
+    FUNCTION = "count"
+    CATEGORY = f"{CATEGORY}/logic"
+    DESCRIPTION = "Version number that increments on every run, as an INT and as a label like v004."
+
+    def count(self, version, prefix, padding):
+        return (version, f"{prefix}{version:0{padding}d}")
+
+
 NODE_CLASS_MAPPINGS = {
     "ToolsSwitchAny": SwitchAny,
     "ToolsResolutionPreset": ResolutionPreset,
     "ToolsSeedRange": SeedRange,
+    "ToolsVersionCounter": VersionCounter,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ToolsSwitchAny": "Switch Any (tools)",
     "ToolsResolutionPreset": "Resolution Preset (tools)",
     "ToolsSeedRange": "Seed Range (tools)",
+    "ToolsVersionCounter": "Version Counter (tools)",
 }

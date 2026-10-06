@@ -35,3 +35,11 @@ def test_seed_range_is_deterministic():
 
 def test_seed_range_with_zero_offset_repeats_the_seed():
     assert SeedRange().derive(7, 0) == (7, 7, 7, 7)
+
+
+def test_version_counter():
+    from comfyui_tools.logic_nodes import VersionCounter
+
+    spec = VersionCounter.INPUT_TYPES()["required"]["version"][1]
+    assert spec["control_after_generate"] == "increment"
+    assert VersionCounter().count(4, "v", 3) == (4, "v004")

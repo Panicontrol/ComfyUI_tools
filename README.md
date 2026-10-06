@@ -126,6 +126,7 @@ the number of paragraphs that actually made it in.
 | **Switch Any** | Route one of two inputs of any type through a boolean. Lazy — only the selected branch is evaluated. |
 | **Resolution Preset** | Common SD1.5 / SDXL / HD resolutions with orientation, scaling and multiple-of rounding. |
 | **Seed Range** | Derive three extra deterministic seeds from one seed and an offset. |
+| **Version Counter** | A version number that goes up by one on every run — ComfyUI's own *control after generate* switch, set to `increment` by default. Outputs the `INT` and a `label` such as `v004` (`prefix` + zero `padding`). |
 
 ## Adding a node
 
