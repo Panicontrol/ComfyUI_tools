@@ -1,5 +1,6 @@
 """Image utility nodes."""
 
+import json
 import os
 import re
 
@@ -522,14 +523,23 @@ def output_directory(directory):
         return os.path.abspath(path)
 
 
-def write_mp4(path, pixels, frame_rate):
-    """Encode ``[N, H, W, 3]`` uint8 frames as an H.264 mp4."""
+def write_mp4(path, pixels, frame_rate, metadata=None):
+    """Encode ``[N, H, W, 3]`` uint8 frames as an H.264 mp4.
+
+    ``metadata`` values are written as container tags (dicts as JSON), the way
+    ComfyUI's own Save Video stores ``workflow`` and ``prompt`` -- dropping the
+    mp4 onto ComfyUI then loads the workflow back.
+    """
     import av  # ships with ComfyUI
     from fractions import Fraction
 
     height, width = pixels.shape[1], pixels.shape[2]
     pad_h, pad_w = height % 2, width % 2  # yuv420p needs even sides
-    with av.open(path, mode="w") as container:
+    # without use_metadata_tags the mp4 muxer drops custom keys
+    options = {"movflags": "use_metadata_tags+faststart"}
+    with av.open(path, mode="w", options=options) as container:
+        for key, value in (metadata or {}).items():
+            container.metadata[key] = value if isinstance(value, str) else json.dumps(value)
         stream = container.add_stream("h264", rate=Fraction(round(frame_rate * 1000), 1000))
         stream.width = width + pad_w
         stream.height = height + pad_h
@@ -542,6 +552,21 @@ def write_mp4(path, pixels, frame_rate):
                 container.mux(packet)
         for packet in stream.encode():
             container.mux(packet)
+
+
+def workflow_metadata(prompt, extra_pnginfo):
+    """ComfyUI's workflow/prompt tags, unless metadata is disabled (--disable-metadata)."""
+    try:
+        from comfy.cli_args import args
+
+        if args.disable_metadata:
+            return None
+    except Exception:
+        pass
+    metadata = dict(extra_pnginfo or {})  # carries "workflow"
+    if prompt is not None:
+        metadata["prompt"] = prompt
+    return metadata or None
 
 
 class SaveImageSequence:
@@ -595,6 +620,7 @@ class SaveImageSequence:
                     "tooltip": "Also zip the PNG sequence next to the video as <name>_v###.zip.",
                 }),
             },
+            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
 
     RETURN_TYPES = ("STRING", "INT", "INT", "STRING")
@@ -607,7 +633,7 @@ class SaveImageSequence:
 
     def save(self, images, save_folder, new_folder, number_version, start_frame_index,
              padding_frame_name, overwrite, masks=None, frame_rate=24.0, need_save=True,
-             need_zip=False):
+             need_zip=False, prompt=None, extra_pnginfo=None):
         import io
         import zipfile
 
@@ -677,7 +703,7 @@ class SaveImageSequence:
                 if archive is not None:
                     archive.close()
 
-        write_mp4(video_path, pixels, float(frame_rate))
+        write_mp4(video_path, pixels, float(frame_rate), workflow_metadata(prompt, extra_pnginfo))
 
         return {"ui": {"text": [video_path]}, "result": (folder, number_version, frames, video_path)}
 

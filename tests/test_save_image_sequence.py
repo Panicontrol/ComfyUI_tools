@@ -42,3 +42,15 @@ def test_existing_files_are_kept_unless_overwrite(tmp_path):
     with pytest.raises(ValueError, match="raise number_version"):
         save(images, tmp_path)
     save(images, tmp_path, overwrite=True)
+
+
+def test_workflow_is_embedded_in_the_video(tmp_path):
+    import json
+
+    workflow = {"nodes": [{"id": 1, "type": "ToolsSaveImageSequence"}], "links": []}
+    prompt = {"1": {"class_type": "ToolsSaveImageSequence", "inputs": {}}}
+    *_, video = save(torch.rand(1, 4, 4, 3), tmp_path, need_save=False,
+                     prompt=prompt, extra_pnginfo={"workflow": workflow})
+    with av.open(video) as container:
+        assert json.loads(container.metadata["workflow"]) == workflow
+        assert json.loads(container.metadata["prompt"]) == prompt
