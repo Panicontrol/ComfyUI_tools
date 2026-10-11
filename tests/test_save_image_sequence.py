@@ -54,3 +54,14 @@ def test_workflow_is_embedded_in_the_video(tmp_path):
     with av.open(video) as container:
         assert json.loads(container.metadata["workflow"]) == workflow
         assert json.loads(container.metadata["prompt"]) == prompt
+
+
+def test_workflow_embedding_can_be_off_and_json_saved_instead(tmp_path):
+    import json
+
+    workflow = {"nodes": [{"id": 1}], "links": []}
+    *_, video = save(torch.rand(1, 4, 4, 3), tmp_path, need_save=False, embed_workflow=False,
+                     save_workflow_json=True, prompt={"1": {}}, extra_pnginfo={"workflow": workflow})
+    with av.open(video) as container:
+        assert "workflow" not in container.metadata
+    assert json.loads((tmp_path / "depth_v004.json").read_text()) == workflow

@@ -619,6 +619,14 @@ class SaveImageSequence:
                     "default": False,
                     "tooltip": "Also zip the PNG sequence next to the video as <name>_v###.zip.",
                 }),
+                "embed_workflow": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Write the workflow into the mp4, so dropping it onto ComfyUI loads the graph.",
+                }),
+                "save_workflow_json": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Also save the workflow next to the video as <name>_v###.json.",
+                }),
             },
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
@@ -633,7 +641,8 @@ class SaveImageSequence:
 
     def save(self, images, save_folder, new_folder, number_version, start_frame_index,
              padding_frame_name, overwrite, masks=None, frame_rate=24.0, need_save=True,
-             need_zip=False, prompt=None, extra_pnginfo=None):
+             need_zip=False, embed_workflow=True, save_workflow_json=False, prompt=None,
+             extra_pnginfo=None):
         import io
         import zipfile
 
@@ -648,6 +657,7 @@ class SaveImageSequence:
         folder = os.path.join(project, versioned)
         video_path = os.path.join(project, f"{versioned}.mp4")
         zip_path = os.path.join(project, f"{versioned}.zip")
+        json_path = os.path.join(project, f"{versioned}.json")
 
         frames = int(images.shape[0])
         names = [
@@ -658,6 +668,8 @@ class SaveImageSequence:
         targets = [video_path]
         if need_zip:
             targets.append(zip_path)
+        if save_workflow_json:
+            targets.append(json_path)
         if need_save:
             targets += [os.path.join(folder, n) for n in names]
         if not overwrite:
@@ -703,7 +715,15 @@ class SaveImageSequence:
                 if archive is not None:
                     archive.close()
 
-        write_mp4(video_path, pixels, float(frame_rate), workflow_metadata(prompt, extra_pnginfo))
+        metadata = workflow_metadata(prompt, extra_pnginfo) if embed_workflow else None
+        write_mp4(video_path, pixels, float(frame_rate), metadata)
+
+        if save_workflow_json:
+            # the UI graph loads back by dropping the file on ComfyUI; a run
+            # queued through the API has none, so fall back to its prompt
+            workflow = (extra_pnginfo or {}).get("workflow") or prompt or {}
+            with open(json_path, "w", encoding="utf-8") as handle:
+                json.dump(workflow, handle, indent=2, ensure_ascii=False)
 
         return {"ui": {"text": [video_path]}, "result": (folder, number_version, frames, video_path)}
 
