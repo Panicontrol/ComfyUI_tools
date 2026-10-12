@@ -149,6 +149,43 @@ position, so a widget added among the existing ones shifts every value after it
 in workflows people have already saved. Append new widgets after the old ones,
 and keep editor-only settings in node properties instead.
 
+## Parameter sweeps
+
+`scripts/comfy_sweep.py` runs one workflow many times with different settings on
+a ComfyUI server — locally or across a VPN — and collects the results. It needs
+nothing beyond Python 3.10+.
+
+1. In ComfyUI, save the workflow with **Workflow → Export (API)**.
+2. See which inputs can be varied:
+
+   ```bash
+   python scripts/comfy_sweep.py workflow_api.json --list
+   ```
+
+3. Run the sweep. Inputs are `<node>.<input>`, where `<node>` is a node id, its
+   title or its class type (titles and class types must be unique):
+
+   ```bash
+   python scripts/comfy_sweep.py workflow_api.json --server http://10.0.0.2:8188 \
+       --param 'KSampler.cfg=[4, 6, 8]' --param 'KSampler.seed=[1, 2]' \
+       --set 'Positive.text=a red fox in the snow'
+   ```
+
+   `--param` takes a JSON list and every combination is run (here 3 × 2 = 6);
+   `--set` fixes a value for all runs. The same can live in a file passed with
+   `--grid`: `{"set": {…}, "params": {…}, "runs": [{…}, {…}]}`, where `runs` lists
+   hand-picked combinations that are each crossed with `params`.
+
+Runs are queued one at a time, so the timings are comparable. Each run gets a
+folder in `sweeps/<workflow>_<timestamp>/` (or `--out`) with the exact
+`prompt.json` that was sent and its downloaded outputs; `results.json` and
+`results.csv` list the parameters, status, error, duration and files of every
+run. `--dry-run` checks the parameters and prints the runs without queuing
+anything, `--timeout` interrupts a run that hangs, `--header` adds e.g. an
+`Authorization` header, and the server defaults to `$COMFYUI_URL` or
+`http://127.0.0.1:8188`. A server on another machine must be started with
+`--listen` so it accepts connections from outside.
+
 ## Tests
 
 ```bash
@@ -157,6 +194,7 @@ python -m pytest
 ```
 
 The suite runs standalone — it does not need a ComfyUI checkout, only `torch`.
+The sweep tests start a fake ComfyUI server on localhost.
 
 ## License
 
