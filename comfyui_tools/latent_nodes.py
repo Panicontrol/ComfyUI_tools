@@ -138,7 +138,11 @@ class SaveLatentTo:
         path = next_free_path(folder, filename_prefix.strip() or "latent")
 
         tensors, metadata = pack(samples)
-        safetensors.torch.save_file(tensors, path, metadata=metadata)
+        # safetensors' save_file creates the file 0600 whatever the umask, so
+        # other users and tools on Linux cannot read it; writing the bytes
+        # with open() gives the usual permissions, like every other output
+        with open(path, "wb") as handle:
+            handle.write(safetensors.torch.save(tensors, metadata=metadata))
         return {"ui": {"text": [path]}, "result": (samples, path)}
 
 

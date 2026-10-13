@@ -53,3 +53,15 @@ def test_reads_comfyui_own_latent_files(tmp_path):
         {"latent_tensor": tensor, "latent_format_version_0": torch.tensor([])}, str(path)
     )
     assert torch.equal(LoadLatentFrom().load(str(path))[0]["samples"], tensor)
+
+
+def test_saved_file_follows_the_umask(tmp_path):
+    import os
+    import stat
+
+    old = os.umask(0o022)
+    try:
+        _, path = SaveLatentTo().save({"samples": torch.zeros(1, 4, 2, 2)}, str(tmp_path), "p")["result"]
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o644
