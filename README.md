@@ -91,7 +91,7 @@ H3 audio VAE runs at, so LanPaint never has to resample (that path needs
 | --- | --- |
 | **Save Latent To** | Save a `LATENT` to any folder (created if missing) as `<prefix>_00001.latent`, `_00002`, … Keeps everything in the latent: MiniMax H3 video+audio `NestedTensor`s, `noise_mask`, dtype. Also outputs the saved `path`. |
 | **Load Latent From** | Load a `.latent` file from any path — absolute, or relative to ComfyUI's output or input folder — and rebuild the latent exactly. Also reads files saved by ComfyUI's own Save Latent. |
-| **H3 Encode Still** | Encode images with the MiniMax H3 video VAE into single-frame (T=1) still latents, one per image — for trying latent img2img on H3 stills (feed it instead of an empty still latent, sample with denoise below 1). ComfyUI's VAE Encode treats a batch of images as the frames of one video; this node keeps them as separate stills. |
+| **H3 Encode Still** | For trying latent img2img on MiniMax H3 stills: takes the still latent you would sample (e.g. Fizgig H3 Still Latent), encodes the image with the H3 video VAE at that latent's size and swaps it in as the video part, keeping the audio part H3 needs. Batch 1, as H3 requires; sample with denoise below 1. |
 
 ### tools/text
 

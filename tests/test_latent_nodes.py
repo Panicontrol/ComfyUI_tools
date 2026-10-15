@@ -67,24 +67,25 @@ def test_saved_file_follows_the_umask(tmp_path):
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o644
 
 
-def test_encode_still_makes_one_latent_per_image():
+def test_encode_still_swaps_only_the_video_part():
     import pytest
 
     from comfyui_tools.latent_nodes import EncodeStillH3
 
-    class StillVAE:  # like ComfyUI's wrapper with the H3 VAE: 1 image -> [1, 24, 1, h, w]
+    class StillVAE:  # ComfyUI's H3 VAE on one image: [1, 24, 1, H/16, W/16]
         def encode(self, pixels):
-            assert pixels.shape[0] == 1
-            return torch.full((1, 24, 1, pixels.shape[1] // 16, pixels.shape[2] // 16), float(pixels[0, 0, 0, 0]))
+            return torch.ones(1, 24, 1, pixels.shape[1] // 16, pixels.shape[2] // 16)
 
-    images = torch.stack([torch.full((64, 96, 3), float(i)) for i in range(3)])
-    latent = EncodeStillH3().encode(StillVAE(), images)[0]["samples"]
-    assert latent.shape == (3, 24, 1, 4, 6)
-    assert [float(v) for v in latent[:, 0, 0, 0, 0]] == [0.0, 1.0, 2.0]
+    audio = torch.randn(1, 32, 2, 2)
+    still = {"samples": FakeNested([torch.zeros(1, 24, 1, 4, 6), audio]), "extra": 1}
+    image = torch.rand(1, 50, 70, 3)  # any size: resized to the latent's 64x96 canvas
 
-    class VideoVAE:
-        def encode(self, pixels):
-            return torch.zeros(1, 24, 2, 4, 6)
+    out = EncodeStillH3().encode(StillVAE(), image, still)[0]
+    video_out, audio_out = out["samples"].tensors
+    assert video_out.shape == (1, 24, 1, 4, 6) and video_out.min() == 1.0
+    assert audio_out is audio and out["extra"] == 1
 
-    with pytest.raises(ValueError, match="not a single frame"):
-        EncodeStillH3().encode(VideoVAE(), images)
+    with pytest.raises(ValueError, match="video \\+ audio"):
+        EncodeStillH3().encode(StillVAE(), image, {"samples": torch.zeros(1, 24, 1, 4, 6)})
+    with pytest.raises(ValueError, match="one still at a time"):
+        EncodeStillH3().encode(StillVAE(), torch.rand(2, 64, 96, 3), still)

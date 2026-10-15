@@ -184,13 +184,13 @@ class LoadLatentFrom:
 
 
 class EncodeStillH3:
-    """Encode images into single-frame (T=1) MiniMax H3 latents, one still per image.
+    """Put an encoded image into a MiniMax H3 still latent, for latent img2img tests.
 
-    For trying latent img2img on H3 stills: feed this instead of an empty
-    still latent and sample with denoise below 1. ComfyUI's own VAE Encode
-    already gives a one-frame latent for a single image, but it treats a batch
-    of images as the frames of one video; this node encodes each image on its
-    own and stacks the results as a batch of stills.
+    H3 samples a NestedTensor pair (video, audio), batch 1. Connect the still
+    latent you would sample from (e.g. Fizgig H3 Still Latent): this node
+    encodes the image with the H3 video VAE, resized to that latent's canvas,
+    and swaps it in as the video part. The audio part and every other key stay
+    exactly as the still latent made them. Sample with denoise below 1.
     """
 
     @classmethod
@@ -198,7 +198,8 @@ class EncodeStillH3:
         return {
             "required": {
                 "vae": ("VAE", {"tooltip": "The MiniMax H3 video VAE."}),
-                "images": ("IMAGE", {"tooltip": "Each image becomes its own single-frame latent."}),
+                "images": ("IMAGE", {"tooltip": "The still to start from; resized to the latent's size."}),
+                "latent": ("LATENT", {"tooltip": "The H3 still latent to fill, e.g. Fizgig H3 Still Latent."}),
             },
         }
 
@@ -206,21 +207,35 @@ class EncodeStillH3:
     RETURN_NAMES = ("latent",)
     FUNCTION = "encode"
     CATEGORY = f"{CATEGORY}/latent"
-    DESCRIPTION = "Encode images into single-frame MiniMax H3 still latents (one per image) for img2img tests."
+    DESCRIPTION = "Swap an encoded image into a MiniMax H3 still latent (keeps its audio part) for img2img tests."
 
-    def encode(self, vae, images):
-        latents = []
-        for index in range(images.shape[0]):
-            latent = vae.encode(images[index:index + 1, :, :, :3])
-            if latent.ndim != 5 or latent.shape[2] != 1:
-                raise ValueError(
-                    f"the VAE returned a latent of shape {tuple(latent.shape)}, not a single frame "
-                    "[1, C, 1, H, W]; use the MiniMax H3 video VAE on a ComfyUI recent enough to "
-                    "encode single frames"
-                )
-            latents.append(latent)
-        return ({"samples": torch.cat(latents, dim=0)},)
+    def encode(self, vae, images, latent):
+        from .utils import resize_image
 
+        samples = latent["samples"]
+        if not is_nested(samples) or len(samples.tensors) < 2:
+            raise ValueError(
+                "connect a MiniMax H3 still latent (video + audio), such as Fizgig H3 Still Latent; "
+                "H3 cannot sample a video-only latent"
+            )
+        video, *rest = samples.tensors
+        if video.shape[0] != 1 or images.shape[0] != 1:
+            raise ValueError("MiniMax H3 samples one still at a time: use batch size 1 and a single image")
+        if video.ndim != 5 or video.shape[2] != 1:
+            raise ValueError(f"the latent's video part is {tuple(video.shape)}, not a single frame [1, 24, 1, H, W]")
+
+        height, width = video.shape[3] * 16, video.shape[4] * 16
+        image = resize_image(images[:1, :, :, :3], width, height, "lanczos")
+        encoded = vae.encode(image)
+        if tuple(encoded.shape) != tuple(video.shape):
+            raise ValueError(
+                f"the VAE returned {tuple(encoded.shape)} but the latent needs {tuple(video.shape)}; "
+                "use the MiniMax H3 video VAE"
+            )
+
+        out = dict(latent)
+        out["samples"] = type(samples)([encoded.to(device=video.device, dtype=video.dtype), *rest])
+        return (out,)
 
 NODE_CLASS_MAPPINGS = {
     "ToolsSaveLatentTo": SaveLatentTo,
