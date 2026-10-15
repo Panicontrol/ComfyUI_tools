@@ -65,3 +65,26 @@ def test_saved_file_follows_the_umask(tmp_path):
     finally:
         os.umask(old)
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o644
+
+
+def test_encode_still_makes_one_latent_per_image():
+    import pytest
+
+    from comfyui_tools.latent_nodes import EncodeStillH3
+
+    class StillVAE:  # like ComfyUI's wrapper with the H3 VAE: 1 image -> [1, 24, 1, h, w]
+        def encode(self, pixels):
+            assert pixels.shape[0] == 1
+            return torch.full((1, 24, 1, pixels.shape[1] // 16, pixels.shape[2] // 16), float(pixels[0, 0, 0, 0]))
+
+    images = torch.stack([torch.full((64, 96, 3), float(i)) for i in range(3)])
+    latent = EncodeStillH3().encode(StillVAE(), images)[0]["samples"]
+    assert latent.shape == (3, 24, 1, 4, 6)
+    assert [float(v) for v in latent[:, 0, 0, 0, 0]] == [0.0, 1.0, 2.0]
+
+    class VideoVAE:
+        def encode(self, pixels):
+            return torch.zeros(1, 24, 2, 4, 6)
+
+    with pytest.raises(ValueError, match="not a single frame"):
+        EncodeStillH3().encode(VideoVAE(), images)

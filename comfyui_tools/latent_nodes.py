@@ -183,12 +183,53 @@ class LoadLatentFrom:
         return (unpack(tensors, metadata),)
 
 
+class EncodeStillH3:
+    """Encode images into single-frame (T=1) MiniMax H3 latents, one still per image.
+
+    For trying latent img2img on H3 stills: feed this instead of an empty
+    still latent and sample with denoise below 1. ComfyUI's own VAE Encode
+    already gives a one-frame latent for a single image, but it treats a batch
+    of images as the frames of one video; this node encodes each image on its
+    own and stacks the results as a batch of stills.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "vae": ("VAE", {"tooltip": "The MiniMax H3 video VAE."}),
+                "images": ("IMAGE", {"tooltip": "Each image becomes its own single-frame latent."}),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    FUNCTION = "encode"
+    CATEGORY = f"{CATEGORY}/latent"
+    DESCRIPTION = "Encode images into single-frame MiniMax H3 still latents (one per image) for img2img tests."
+
+    def encode(self, vae, images):
+        latents = []
+        for index in range(images.shape[0]):
+            latent = vae.encode(images[index:index + 1, :, :, :3])
+            if latent.ndim != 5 or latent.shape[2] != 1:
+                raise ValueError(
+                    f"the VAE returned a latent of shape {tuple(latent.shape)}, not a single frame "
+                    "[1, C, 1, H, W]; use the MiniMax H3 video VAE on a ComfyUI recent enough to "
+                    "encode single frames"
+                )
+            latents.append(latent)
+        return ({"samples": torch.cat(latents, dim=0)},)
+
+
 NODE_CLASS_MAPPINGS = {
     "ToolsSaveLatentTo": SaveLatentTo,
     "ToolsLoadLatentFrom": LoadLatentFrom,
+    "ToolsEncodeStillH3": EncodeStillH3,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ToolsSaveLatentTo": "Save Latent To (tools)",
     "ToolsLoadLatentFrom": "Load Latent From (tools)",
+    "ToolsEncodeStillH3": "H3 Encode Still (tools)",
 }
