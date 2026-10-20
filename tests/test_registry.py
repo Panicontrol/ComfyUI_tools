@@ -34,4 +34,5 @@ def test_all_node_packs_are_discovered():
         "tools/logic",
         "tools/av",
         "tools/latent",
+        "tools/video",
     }

@@ -85,6 +85,12 @@ Both silence nodes default to a 32 kHz sample rate, which is what the MiniMax
 H3 audio VAE runs at, so LanPaint never has to resample (that path needs
 `torchaudio`).
 
+### tools/video
+
+| Node | What it does |
+| --- | --- |
+| **Tools Video Reel: concat + stamp** | Concatenate mp4 clips into one reel at `output_path` (H.264, `crf`), with each clip's own text stamp in the top-left corner on a translucent box. `items` holds one block per clip, separated by a blank line: the clip's absolute path, then its stamp lines. Clips of another size are fitted into `width` × `height` on black; `frame_step` 2 with `frame_rate` 12 keeps every second frame. Frames are streamed, so long reels never sit in memory; an existing reel is kept unless `overwrite` is on. |
+
 ### tools/latent
 
 | Node | What it does |
