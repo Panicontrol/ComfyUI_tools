@@ -608,6 +608,115 @@ class H3LatentPaste:
         return (out,)
 
 
+def otsu_threshold(values, bins=256):
+    """The threshold that best splits values into two groups (Otsu)."""
+    lo, hi = float(values.min()), float(values.max())
+    if hi - lo < 1e-8:
+        return hi
+    hist = torch.histc(values.float(), bins=bins, min=lo, max=hi)
+    centers = torch.linspace(lo, hi, bins)
+    weight_lo = hist.cumsum(0)
+    weight_hi = hist.sum() - weight_lo
+    mean_lo = (hist * centers).cumsum(0) / weight_lo.clamp(min=1e-8)
+    mean_hi = ((hist * centers).sum() - (hist * centers).cumsum(0)) / weight_hi.clamp(min=1e-8)
+    between = weight_lo * weight_hi * (mean_lo - mean_hi) ** 2
+    return float(centers[int(between.argmax())])
+
+
+class H3LatentDiffMask:
+    """Find where a prompt edit changed a MiniMax H3 shot, by comparing two latents.
+
+    latent_a is the source, latent_b the edited shot, both encoded with the H3
+    VAE at the same size and frame count. Regeneration shifts colour and grain
+    over the whole frame, so the per-channel median shift is removed first and
+    each channel is scaled by the source's spread; what is left is scored per
+    16 px latent cell. Cells above the threshold (Otsu's automatic split by
+    default) become the mask, cleaned of stray cells, smoothed over time, then
+    grown and feathered. White = changed, ready for H3 Latent Mask Merge to
+    keep the source everywhere else.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent_a": ("LATENT", {"tooltip": "The source shot."}),
+                "latent_b": ("LATENT", {"tooltip": "The edited shot, same size and frame count."}),
+                "threshold": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 5.0, "step": 0.01,
+                    "tooltip": "Change score a cell needs to count as edited; 0 = automatic (Otsu). "
+                               "The score is about 0 for untouched cells and 1.4 for unrelated content.",
+                }),
+                "clean": ("INT", {
+                    "default": 1, "min": 0, "max": 8, "step": 1,
+                    "tooltip": "Drop specks and fill pinholes smaller than this many latent cells (16 px).",
+                }),
+                "temporal_smooth": ("INT", {
+                    "default": 1, "min": 0, "max": 8, "step": 1,
+                    "tooltip": "Average the score over this many latent tokens either side (a token is 4 frames).",
+                }),
+                "grow": ("INT", {"default": 16, "min": -256, "max": 256, "step": 1,
+                                 "tooltip": "Pixels to widen (+) or shrink (-) the changed area."}),
+                "feather": ("INT", {"default": 32, "min": 0, "max": 256, "step": 1,
+                                    "tooltip": "Soft edge in pixels."}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK", "MASK", "STRING")
+    RETURN_NAMES = ("mask", "heatmap", "info")
+    FUNCTION = "diff"
+    CATEGORY = f"{CATEGORY}/latent"
+    DESCRIPTION = "Mask of what a prompt edit changed, from the source and edited MiniMax H3 latents."
+
+    def diff(self, latent_a, latent_b, threshold=0.0, clean=1, temporal_smooth=1, grow=16, feather=32):
+        import torch.nn.functional as F
+
+        from .mask_nodes import MaskGrowFeather
+
+        _, va, _ = h3_av_parts(latent_a, "latent_a")
+        _, vb, _ = h3_av_parts(latent_b, "latent_b")
+        if tuple(va.shape) != tuple(vb.shape):
+            raise ValueError(
+                f"the video parts differ: latent_a {tuple(va.shape)}, latent_b {tuple(vb.shape)}; "
+                "encode both at the same size and frame count"
+            )
+        a, b = va[0].float(), vb.to(va.device)[0].float()  # [C, T, h, w]
+        d = b - a
+        d = d - d.flatten(1).median(dim=1).values.view(-1, 1, 1, 1)  # overall colour / exposure drift
+        spread = a.flatten(1).std(dim=1).clamp(min=1e-4).view(-1, 1, 1, 1)
+        score = (d / spread).pow(2).mean(0).sqrt()  # [T, h, w]
+
+        tokens, rows, cols = score.shape
+        if temporal_smooth > 0 and tokens > 1:
+            k = 2 * temporal_smooth + 1
+            score = F.avg_pool1d(score.permute(1, 2, 0).reshape(-1, 1, tokens), k, 1, temporal_smooth,
+                                 count_include_pad=False).reshape(rows, cols, tokens).permute(2, 0, 1)
+        cut = threshold if threshold > 0 else otsu_threshold(score.flatten())
+        cells = (score > cut).float()[:, None]  # [T, 1, h, w]
+        if clean > 0:
+            k = 2 * clean + 1
+            cells = -F.max_pool2d(-F.max_pool2d(cells, k, 1, clean), k, 1, clean)  # close: fill holes
+            cells = F.max_pool2d(-F.max_pool2d(-cells, k, 1, clean), k, 1, clean)   # open: drop specks
+        share = float(cells.mean())
+
+        # tokens -> frames (1, 4, 4, 4, 4 per group), then grow / feather on a 4 px grid
+        index = torch.cat([torch.full((FRAME_PER_TOKEN[t % len(FRAME_PER_TOKEN)],), t) for t in range(tokens)])
+        work = F.interpolate(cells, size=(rows * 4, cols * 4), mode="nearest")[:, 0]
+        if grow or feather > 0:
+            work = MaskGrowFeather().process(work, int(round(grow / 4)),
+                                             min(int(round(feather / 4)), min(work.shape[1:]) - 1), False)[0]
+        mask = F.interpolate(work[:, None], size=(rows * 16, cols * 16), mode="bilinear",
+                             align_corners=False)[:, 0].clamp(0.0, 1.0)[index]
+        heat = (score / max(cut * 2.0, 1e-6)).clamp(0.0, 1.0)[:, None]
+        heat = F.interpolate(heat, size=(rows * 4, cols * 4), mode="bilinear", align_corners=False)[:, 0][index]
+
+        info = (f"changed {share:.1%} of the shot, threshold {cut:.3f}"
+                f"{' (auto)' if threshold <= 0 else ''}; score median {float(score.median()):.3f}, "
+                f"max {float(score.max()):.3f}; {len(index)} frames")
+        logging.info("[H3 Latent Diff Mask] %s", info)
+        return (mask, heat, info)
+
+
 NODE_CLASS_MAPPINGS = {
     "ToolsSaveLatentTo": SaveLatentTo,
     "ToolsLoadLatentFrom": LoadLatentFrom,
@@ -615,6 +724,7 @@ NODE_CLASS_MAPPINGS = {
     "ToolsH3LatentMaskMerge": H3LatentMaskMerge,
     "ToolsH3LatentCrop": H3LatentCrop,
     "ToolsH3LatentPaste": H3LatentPaste,
+    "ToolsH3LatentDiffMask": H3LatentDiffMask,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -624,4 +734,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ToolsH3LatentMaskMerge": "H3 Latent Mask Merge (tools)",
     "ToolsH3LatentCrop": "H3 Latent Crop (tools)",
     "ToolsH3LatentPaste": "H3 Latent Paste (tools)",
+    "ToolsH3LatentDiffMask": "H3 Latent Diff Mask (tools)",
 }

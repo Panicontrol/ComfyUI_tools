@@ -167,3 +167,21 @@ def test_h3_crop_around_a_mask():
     _, crop, cut, _ = H3LatentCrop().crop(h3_latent(), 0, 0, 0, 0, 0, 0, mask=mask, padding=8)
     assert (crop["x"], crop["y"], crop["width"], crop["height"]) == (64, 32, 64, 96)
     assert crop["frames"] == 39 and float(cut.max()) == 1.0
+
+
+def test_h3_diff_mask_finds_the_edit_not_the_drift():
+    from comfyui_tools.latent_nodes import H3LatentDiffMask
+
+    g = torch.Generator().manual_seed(0)
+    a = torch.randn(1, 24, 12, 8, 12, generator=g)
+    b = a + 0.3 + 0.1 * torch.randn(a.shape, generator=g)  # colour drift + regeneration noise everywhere
+    b[:, :, 5:12, 2:6, 6:10] = torch.randn(1, 24, 7, 4, 4, generator=g)  # the actual edit
+    audio = torch.zeros(1, 32, 2, 65)
+    la, lb = {"samples": FakeNested([a, audio])}, {"samples": FakeNested([b, audio])}
+
+    mask, heat, info = H3LatentDiffMask().diff(la, lb, temporal_smooth=0, grow=0, feather=0)
+    assert mask.shape == (39, 128, 192) and heat.shape == (39, 32, 48)  # 12 tokens = 39 frames
+    assert float(mask[30, 64, 128]) == 1.0      # inside the edit (token 9, cell 4,8)
+    assert float(mask[30, 16, 16]) == 0.0       # drifted but unedited
+    assert float(mask[10, 64, 128]) == 0.0      # same place before the edit starts (token 3)
+    assert "auto" in info
