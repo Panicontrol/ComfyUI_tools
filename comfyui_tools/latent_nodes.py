@@ -247,19 +247,37 @@ def frames_for_tokens(n):
     return sum(FRAME_PER_TOKEN[i % len(FRAME_PER_TOKEN)] for i in range(n))
 
 
-def mask_to_h3_latent(mask, tokens, height, width, reduce="min"):
+def mask_to_h3_latent(mask, tokens, height, width, reduce="min", grow=0, feather=0):
     """A pixel MASK ([F, H, W] or [H, W]) as a [1, 1, T, h, w] latent mask.
 
-    Each frame is area-downscaled to the latent grid, then the frames of every
-    latent token are reduced to one: min keeps a cell 0 if it is 0 in any of
-    the token's frames, max keeps it 1 if it is 1 in any, mean averages them.
+    Each frame is grown or shrunk by ``grow`` px and blurred by ``feather`` px
+    (as Mask Grow / Feather), then area-downscaled to the latent grid. Both
+    happen on a 4 px grid -- a latent cell is 16 px, so finer detail would be
+    averaged away anyway -- with the radii scaled to match, and frames go
+    through a few at a time, so a long full-HD mask stays fast and small. The
+    frames of every latent token are then reduced to one: min keeps a cell 0 if
+    it is 0 in any of the token's frames, max keeps it 1 if it is 1 in any,
+    mean averages them.
     """
     import torch.nn.functional as F
 
-    m = mask.float()
-    if m.ndim == 2:
-        m = m[None]
-    m = F.interpolate(m[:, None], size=(height, width), mode="area")[:, 0]
+    from .mask_nodes import MaskGrowFeather
+
+    m = mask if mask.ndim == 3 else mask[None]
+    work = (min(m.shape[1], height * 4), min(m.shape[2], width * 4))
+    px = m.shape[2] / work[1]  # mask pixels per work pixel
+    grow = int(round(grow / px))
+    feather = 0 if feather <= 0 else max(1, int(round(feather / px)))
+    feather = min(feather, min(work) - 1)  # reflect padding needs radius < side
+    small = []
+    for start in range(0, m.shape[0], 8):
+        part = m[start:start + 8].float()
+        if part.shape[1:] != work:
+            part = F.interpolate(part[:, None], size=work, mode="area")[:, 0]
+        if grow or feather > 0:
+            part = MaskGrowFeather().process(part, grow, feather, False)[0]
+        small.append(F.interpolate(part[:, None], size=(height, width), mode="area")[:, 0])
+    m = torch.cat(small)
     frames = m.shape[0]
     out = torch.empty((tokens, height, width), dtype=torch.float32)
     for k in range(tokens):
@@ -280,8 +298,8 @@ class H3LatentMaskMerge:
     generated or upscaled shot; the face and anything that must match the
     plate stay black. Both latents need the same video size. The mask may be a
     single frame for the whole clip or one per frame; it is mapped onto H3's
-    latent tokens (1, 4, 4, 4, 4 frames) and blended in latent space, so give
-    it a soft edge of 32 px or more. set_noise_mask also attaches the mask, so
+    latent tokens (1, 4, 4, 4, 4 frames) and blended in latent space; grow and
+    feather shape its edge in pixels first (32+ px hides the 16 px grid). set_noise_mask also attaches the mask, so
     a sampler after this node redraws only the white area.
     """
 
@@ -306,6 +324,19 @@ class H3LatentMaskMerge:
                     "tooltip": "Attach the mask as noise_mask, so the next sampler redraws only the white area.",
                 }),
             },
+            # after the original widgets, so saved workflows keep their values in place
+            "optional": {
+                "grow": ("INT", {
+                    "default": 0, "min": -256, "max": 256, "step": 1,
+                    "tooltip": "Pixels: positive widens the white (latent_b) area, negative widens the "
+                               "black (latent_a) area. Applied before feather.",
+                }),
+                "feather": ("INT", {
+                    "default": 32, "min": 0, "max": 256, "step": 1,
+                    "tooltip": "Gaussian blur of the mask edge in pixels, at full resolution. One latent "
+                               "cell is 16 px, so 32+ hides the grid; 0 if the mask is already soft.",
+                }),
+            },
         }
 
     RETURN_TYPES = ("LATENT",)
@@ -314,7 +345,8 @@ class H3LatentMaskMerge:
     CATEGORY = f"{CATEGORY}/latent"
     DESCRIPTION = "Merge two MiniMax H3 latents by a mask: black keeps latent_a, white takes latent_b."
 
-    def merge(self, latent_a, latent_b, mask, temporal="min", audio="latent_a", set_noise_mask=False):
+    def merge(self, latent_a, latent_b, mask, temporal="min", audio="latent_a", set_noise_mask=False,
+              grow=0, feather=32):
         sa, sb = latent_a["samples"], latent_b["samples"]
         nested = is_nested(sa)
         if nested != is_nested(sb):
@@ -333,7 +365,7 @@ class H3LatentMaskMerge:
         if mask.ndim == 3 and mask.shape[0] not in (1, frames):
             logging.warning("[H3 Latent Mask Merge] the mask has %d frames, the latent covers %d; "
                             "tokens past the mask's end reuse its last frame", mask.shape[0], frames)
-        weight = mask_to_h3_latent(mask, tokens, height, width, temporal).to(va.device)
+        weight = mask_to_h3_latent(mask, tokens, height, width, temporal, grow, feather).to(va.device)
         logging.info("[H3 Latent Mask Merge] mask %s -> latent %s, latent_a kept on %.1f%%",
                      tuple(mask.shape), tuple(weight.shape[2:]), (weight < 0.5).float().mean().item() * 100)
 
