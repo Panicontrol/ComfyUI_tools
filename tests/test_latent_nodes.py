@@ -129,3 +129,41 @@ def test_h3_mask_merge_feather_and_grow_soften_the_edge():
     assert hard.tolist() == [0, 0, 0, 1, 1, 1]
     assert 0 < soft[2] < 0.5 < soft[3] < 1  # the edge now spans the cells around it
     assert grown.tolist() == [0, 0, 1, 1, 1, 1]  # 16 px more white = one cell
+
+
+def h3_latent(tokens=12, rows=8, cols=12, value=0.0):
+    frames = latent_nodes.frames_for_tokens(tokens)
+    return {"samples": FakeNested([torch.full((1, 24, tokens, rows, cols), value),
+                                   torch.arange(round(frames * 5 / 3), dtype=torch.float32).expand(1, 32, 2, -1)])}
+
+
+def test_h3_crop_snaps_to_the_h3_grid_and_pastes_back():
+    from comfyui_tools.latent_nodes import H3LatentCrop, H3LatentPaste
+
+    base = h3_latent()  # 12 tokens = 39 frames, 192x128 px
+    piece, crop, mask, info = H3LatentCrop().crop(base, 40, 20, 50, 40, 20, 10)
+    # box widened to the 32 px grid, frames snapped to start 17 and length 22 (17 + 5)
+    assert (crop["x"], crop["y"], crop["width"], crop["height"]) == (32, 0, 64, 64)
+    assert (crop["start_frame"], crop["frames"], crop["token0"], crop["tokens"]) == (17, 22, 5, 7)
+    video, audio = piece["samples"].tensors
+    assert video.shape == (1, 24, 7, 4, 4) and float(audio[0, 0, 0, 0]) == round(17 * 5 / 3)
+    assert mask.shape == (1, 64, 64)
+
+    sampled = {"samples": FakeNested([torch.ones_like(video), audio])}
+    out = H3LatentPaste().paste(base, sampled, crop, feather=0)[0]["samples"].tensors[0]
+    assert float(out[0, 0, 6, 1, 3]) == 1.0                    # inside the box
+    assert float(out[0, 0, 6, 1, 1]) == 0.0 and float(out[0, 0, 2, 1, 3]) == 0.0  # outside, before
+
+    soft = H3LatentPaste().paste(base, sampled, crop, feather=32)[0]["samples"].tensors[0]
+    assert float(soft[0, 0, 6, 0, 2]) < 0.5 < float(soft[0, 0, 6, 1, 3])  # fades in from the box edge
+    assert float(soft[0, 0, 6, 0, 1]) == 0.0                   # nothing outside the box
+
+
+def test_h3_crop_around_a_mask():
+    from comfyui_tools.latent_nodes import H3LatentCrop
+
+    mask = torch.zeros(1, 128, 192)
+    mask[:, 70:90, 100:120] = 1.0
+    _, crop, cut, _ = H3LatentCrop().crop(h3_latent(), 0, 0, 0, 0, 0, 0, mask=mask, padding=8)
+    assert (crop["x"], crop["y"], crop["width"], crop["height"]) == (64, 32, 64, 96)
+    assert crop["frames"] == 39 and float(cut.max()) == 1.0

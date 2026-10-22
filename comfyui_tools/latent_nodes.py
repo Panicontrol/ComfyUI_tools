@@ -237,6 +237,7 @@ class EncodeStillH3:
         out["samples"] = type(samples)([encoded.to(device=video.device, dtype=video.dtype), *rest])
         return (out,)
 
+
 try:  # frames per latent token in MiniMax H3: 1, 4, 4, 4, 4, then repeats
     from comfy.ldm.minimax.model import FRAME_PER_TOKEN
 except Exception:  # pragma: no cover - outside ComfyUI or older builds
@@ -386,11 +387,234 @@ class H3LatentMaskMerge:
         return (out,)
 
 
+H3_CLIP = 17  # an H3 clip is 17k + 5 frames; every 17 frames the VAE starts a new 1-frame token
+
+
+def h3_av_parts(latent, what):
+    samples = latent["samples"]
+    if not is_nested(samples) or len(samples.tensors) < 2 or samples.tensors[0].ndim != 5:
+        raise ValueError(f"{what} must be a MiniMax H3 video+audio latent")
+    video, audio = samples.tensors[0], samples.tensors[1]
+    if video.shape[0] != 1:
+        raise ValueError("MiniMax H3 latents are batch 1")
+    return samples, video, audio
+
+
+def audio_index(frame):
+    return round(frame * 5 / 3)  # H3 audio latent runs at 5/3 steps per video frame
+
+
+def mask_bbox(mask, threshold=0.5):
+    """(x, y, w, h) of the area above threshold in any frame, or None if empty."""
+    m = mask if mask.ndim == 3 else mask[None]
+    hit = (m > threshold).any(0)
+    rows, cols = hit.any(1).nonzero(), hit.any(0).nonzero()
+    if len(rows) == 0:
+        return None
+    y0, y1, x0, x1 = int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1
+    return x0, y0, x1 - x0, y1 - y0
+
+
+class H3LatentCrop:
+    """Crop a MiniMax H3 latent in space and time, keeping it a valid H3 latent.
+
+    H3 needs sides that are multiples of 32 px (2x2 latent cells) and clips of
+    17k + 5 frames that start where the VAE starts a 17-frame group, so the box
+    is widened outward to the 32 px grid and the frames snap to that grid. The
+    audio part is cut to the same frames. Connect a mask to crop around its
+    white area (plus padding) instead of x/y/width/height. The crop output
+    carries where the piece came from, for H3 Latent Paste.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent": ("LATENT",),
+                "x": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 32}),
+                "y": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 32}),
+                "width": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 32,
+                                  "tooltip": "0 = to the right edge."}),
+                "height": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 32,
+                                   "tooltip": "0 = to the bottom edge."}),
+                "start_frame": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 17,
+                                        "tooltip": "Snapped down to a multiple of 17."}),
+                "length": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 17,
+                                   "tooltip": "Frames, snapped up to 17k + 5; 0 = to the end."}),
+            },
+            "optional": {
+                "mask": ("MASK", {"tooltip": "Crop around the white area of any frame instead of x/y/width/height."}),
+                "padding": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 8,
+                                    "tooltip": "Pixels added around the mask's white area."}),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "H3_CROP", "MASK", "STRING")
+    RETURN_NAMES = ("latent", "crop", "mask", "info")
+    FUNCTION = "crop"
+    CATEGORY = f"{CATEGORY}/latent"
+    DESCRIPTION = "Crop a MiniMax H3 latent to a 32 px box and an H3 frame range; paste it back with H3 Latent Paste."
+
+    def crop(self, latent, x, y, width, height, start_frame, length, mask=None, padding=64):
+        samples, video, audio = h3_av_parts(latent, "latent")
+        tokens, cells_h, cells_w = video.shape[2], video.shape[3], video.shape[4]
+        full_w, full_h, frames = cells_w * 16, cells_h * 16, frames_for_tokens(tokens)
+
+        if mask is not None:
+            box = mask_bbox(mask)
+            if box is None:
+                raise ValueError("the mask is empty: nothing to crop around")
+            sx, sy = full_w / mask.shape[-1], full_h / mask.shape[-2]  # mask may be another size
+            bx, by, bw, bh = box
+            x, y = int((bx - padding) * sx), int((by - padding) * sy)
+            width, height = int((bw + 2 * padding) * sx + 0.999), int((bh + 2 * padding) * sy + 0.999)
+        x, y = max(0, x), max(0, y)
+        x1 = full_w if width <= 0 else min(full_w, x + width)
+        y1 = full_h if height <= 0 else min(full_h, y + height)
+        # widen outward to the 32 px grid H3 patches on
+        c0, r0 = x // 32 * 2, y // 32 * 2
+        c1, r1 = min(cells_w, -(-x1 // 32) * 2), min(cells_h, -(-y1 // 32) * 2)
+        if c1 <= c0 or r1 <= r0:
+            raise ValueError(f"the box is outside the {full_w}x{full_h} latent")
+
+        f0 = min(start_frame // H3_CLIP * H3_CLIP, max(0, frames - 5) // H3_CLIP * H3_CLIP)
+        k0 = f0 // H3_CLIP * 5
+        available = tokens - k0
+        if length > 0:
+            n = (max(length, 5) - 5 + H3_CLIP - 1) // H3_CLIP * 5 + 2
+            n = min(n, available)
+        else:
+            n = available
+        k1 = k0 + n
+        f1 = frames_for_tokens(k1)
+
+        cut_video = video[:, :, k0:k1, r0:r1, c0:c1].contiguous()
+        cut_audio = audio[..., audio_index(f0):min(audio.shape[-1], audio_index(f1))].contiguous()
+        out = dict(latent)
+        out["samples"] = type(samples)([cut_video, cut_audio, *samples.tensors[2:]])
+        old = latent.get("noise_mask")
+        out.pop("noise_mask", None)
+        if is_nested(old) and old.tensors[0].ndim == 5 and old.tensors[0].shape[2:] == video.shape[2:]:
+            out["noise_mask"] = type(old)([old.tensors[0][:, :, k0:k1, r0:r1, c0:c1],
+                                           torch.zeros_like(cut_audio, dtype=torch.float32)])
+
+        crop = {"x": c0 * 16, "y": r0 * 16, "width": (c1 - c0) * 16, "height": (r1 - r0) * 16,
+                "start_frame": f0, "frames": f1 - f0, "token0": k0, "tokens": n,
+                "full_width": full_w, "full_height": full_h, "full_frames": frames}
+        if mask is not None:
+            m = mask if mask.ndim == 3 else mask[None]
+            if tuple(m.shape[1:]) != (full_h, full_w):
+                from .utils import resize_mask
+
+                m = resize_mask(m, full_w, full_h)
+            m = m[min(f0, m.shape[0] - 1):f1] if m.shape[0] > 1 else m
+            cut_mask = m[:, r0 * 16:r1 * 16, c0 * 16:c1 * 16]
+        else:
+            cut_mask = torch.ones((1, (r1 - r0) * 16, (c1 - c0) * 16))
+        info = (f"{crop['width']}x{crop['height']} at {crop['x']},{crop['y']} of {full_w}x{full_h}; "
+                f"frames {f0}-{f1 - 1} ({f1 - f0}) of {frames}")
+        logging.info("[H3 Latent Crop] %s", info)
+        return (out, crop, cut_mask, info)
+
+
+class H3LatentPaste:
+    """Put a piece cut by H3 Latent Crop back into the full MiniMax H3 latent.
+
+    The piece must still have the crop's size and frame count (sample it, but
+    do not resize it). Without a mask the whole box is pasted; with one, only
+    its white area -- full-frame or crop-sized, as H3 Latent Crop outputs it.
+    feather fades the edge inside the pasted area, so nothing outside the box
+    is touched and no 16 px step shows.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent": ("LATENT", {"tooltip": "The full latent to paste into."}),
+                "piece": ("LATENT", {"tooltip": "The cropped (and sampled) latent."}),
+                "crop": ("H3_CROP",),
+                "feather": ("INT", {"default": 32, "min": 0, "max": 256, "step": 1,
+                                    "tooltip": "Soft edge in pixels, drawn inside the pasted area."}),
+                "audio": (["latent", "piece"], {
+                    "default": "latent",
+                    "tooltip": "piece writes the piece's audio over its frames.",
+                }),
+            },
+            "optional": {
+                "mask": ("MASK", {"tooltip": "Paste only the white area: full-frame or crop-sized."}),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    FUNCTION = "paste"
+    CATEGORY = f"{CATEGORY}/latent"
+    DESCRIPTION = "Paste a piece from H3 Latent Crop back into the full MiniMax H3 latent, with a soft edge."
+
+    def paste(self, latent, piece, crop, feather=32, audio="latent", mask=None):
+        samples, video, base_audio = h3_av_parts(latent, "latent")
+        _, part, part_audio = h3_av_parts(piece, "piece")
+        k0, n = crop["token0"], crop["tokens"]
+        r0, c0 = crop["y"] // 16, crop["x"] // 16
+        rows, cols = crop["height"] // 16, crop["width"] // 16
+        if (video.shape[3] * 16, video.shape[4] * 16) != (crop["full_height"], crop["full_width"]) \
+                or video.shape[2] < k0 + n:
+            raise ValueError("latent is not the one this crop was cut from")
+        if tuple(part.shape[2:]) != (n, rows, cols):
+            raise ValueError(f"the piece is {tuple(part.shape[2:])} (tokens, rows, cols) but the crop is "
+                             f"{(n, rows, cols)}; paste it at the size it was cropped")
+
+        # the paste mask on a 4 px grid (what mask_to_h3_latent works on), shrunk by
+        # feather so the fade ends at the box edge; frame borders stay put
+        grid = torch.zeros((1, rows * 4, cols * 4))
+        if mask is not None:
+            from .utils import resize_mask
+
+            m = mask if mask.ndim == 3 else mask[None]
+            if tuple(m.shape[1:]) == (crop["full_height"], crop["full_width"]):
+                f0 = crop["start_frame"]
+                m = m[min(f0, m.shape[0] - 1):f0 + crop["frames"]] if m.shape[0] > 1 else m
+                m = m[:, crop["y"]:crop["y"] + crop["height"], crop["x"]:crop["x"] + crop["width"]]
+            grid = resize_mask(m.float(), cols * 4, rows * 4)
+        else:
+            grid = grid + 1.0
+        pad = (c0 * 4, (video.shape[4] - c0 - cols) * 4, r0 * 4, (video.shape[3] - r0 - rows) * 4)
+        import torch.nn.functional as F
+
+        full = F.pad(grid, pad)
+        limit = min(crop["width"], crop["height"]) // 4  # leave the middle of a small box at full weight
+        if feather > limit:
+            logging.info("[H3 Latent Paste] feather %d px -> %d px: the box is %dx%d",
+                         feather, limit, crop["width"], crop["height"])
+        f = int(round(min(feather, limit) / 4))
+        weight = mask_to_h3_latent(full, n, video.shape[3], video.shape[4], "min", grow=-f, feather=f)
+        weight = weight[:, :, :, r0:r0 + rows, c0:c0 + cols].to(video.device)
+
+        merged = video.clone()
+        region = merged[:, :, k0:k0 + n, r0:r0 + rows, c0:c0 + cols].float()
+        merged[:, :, k0:k0 + n, r0:r0 + rows, c0:c0 + cols] = (
+            region + (part.to(video.device).float() - region) * weight).to(video.dtype)
+
+        new_audio = base_audio
+        if audio == "piece":
+            new_audio = base_audio.clone()
+            a0 = audio_index(crop["start_frame"])
+            a1 = min(new_audio.shape[-1], a0 + part_audio.shape[-1])
+            new_audio[..., a0:a1] = part_audio[..., :a1 - a0].to(new_audio.device, new_audio.dtype)
+        out = dict(latent)
+        out.pop("noise_mask", None)
+        out["samples"] = type(samples)([merged, new_audio, *samples.tensors[2:]])
+        return (out,)
+
+
 NODE_CLASS_MAPPINGS = {
     "ToolsSaveLatentTo": SaveLatentTo,
     "ToolsLoadLatentFrom": LoadLatentFrom,
     "ToolsEncodeStillH3": EncodeStillH3,
     "ToolsH3LatentMaskMerge": H3LatentMaskMerge,
+    "ToolsH3LatentCrop": H3LatentCrop,
+    "ToolsH3LatentPaste": H3LatentPaste,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -398,4 +622,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ToolsLoadLatentFrom": "Load Latent From (tools)",
     "ToolsEncodeStillH3": "H3 Encode Still (tools)",
     "ToolsH3LatentMaskMerge": "H3 Latent Mask Merge (tools)",
+    "ToolsH3LatentCrop": "H3 Latent Crop (tools)",
+    "ToolsH3LatentPaste": "H3 Latent Paste (tools)",
 }
