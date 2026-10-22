@@ -1,3 +1,4 @@
+import pytest
 import safetensors.torch
 import torch
 
@@ -89,3 +90,29 @@ def test_encode_still_swaps_only_the_video_part():
         EncodeStillH3().encode(StillVAE(), image, {"samples": torch.zeros(1, 24, 1, 4, 6)})
     with pytest.raises(ValueError, match="one still at a time"):
         EncodeStillH3().encode(StillVAE(), torch.rand(2, 64, 96, 3), still)
+
+
+def test_h3_mask_merge_maps_frames_to_tokens():
+    from comfyui_tools.latent_nodes import H3LatentMaskMerge
+
+    # 6 tokens = 1 + 4 + 4 + 4 + 4 + 1 = 18 frames; latent 4x6 = 64x96 px
+    va, vb = torch.zeros(1, 24, 6, 4, 6), torch.ones(1, 24, 6, 4, 6)
+    a = {"samples": FakeNested([va, torch.full((1, 32, 2, 30), 7.0)])}
+    b = {"samples": FakeNested([vb, torch.zeros(1, 32, 2, 30)])}
+    mask = torch.ones(18, 64, 96)
+    mask[7, :16, :16] = 0  # frame 7 lives in token 2 (frames 5-8)
+
+    out = H3LatentMaskMerge().merge(a, b, mask, set_noise_mask=True)[0]
+    video, audio = out["samples"].tensors
+    assert [float(video[0, 0, k, 0, 0]) for k in range(6)] == [1, 1, 0, 1, 1, 1]
+    assert float(video[0, 0, 2, 3, 5]) == 1.0 and torch.equal(audio, a["samples"].tensors[1])
+    assert out["noise_mask"].tensors[0].shape == (1, 1, 6, 4, 6)
+
+
+def test_h3_mask_merge_rejects_different_sizes():
+    from comfyui_tools.latent_nodes import H3LatentMaskMerge
+
+    a = {"samples": FakeNested([torch.zeros(1, 24, 6, 4, 6), torch.zeros(1, 32, 2, 30)])}
+    b = {"samples": FakeNested([torch.zeros(1, 24, 6, 8, 12), torch.zeros(1, 32, 2, 30)])}
+    with pytest.raises(ValueError, match="video parts differ"):
+        H3LatentMaskMerge().merge(a, b, torch.ones(64, 96))

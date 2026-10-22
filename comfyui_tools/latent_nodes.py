@@ -237,14 +237,133 @@ class EncodeStillH3:
         out["samples"] = type(samples)([encoded.to(device=video.device, dtype=video.dtype), *rest])
         return (out,)
 
+try:  # frames per latent token in MiniMax H3: 1, 4, 4, 4, 4, then repeats
+    from comfy.ldm.minimax.model import FRAME_PER_TOKEN
+except Exception:  # pragma: no cover - outside ComfyUI or older builds
+    FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
+
+
+def frames_for_tokens(n):
+    return sum(FRAME_PER_TOKEN[i % len(FRAME_PER_TOKEN)] for i in range(n))
+
+
+def mask_to_h3_latent(mask, tokens, height, width, reduce="min"):
+    """A pixel MASK ([F, H, W] or [H, W]) as a [1, 1, T, h, w] latent mask.
+
+    Each frame is area-downscaled to the latent grid, then the frames of every
+    latent token are reduced to one: min keeps a cell 0 if it is 0 in any of
+    the token's frames, max keeps it 1 if it is 1 in any, mean averages them.
+    """
+    import torch.nn.functional as F
+
+    m = mask.float()
+    if m.ndim == 2:
+        m = m[None]
+    m = F.interpolate(m[:, None], size=(height, width), mode="area")[:, 0]
+    frames = m.shape[0]
+    out = torch.empty((tokens, height, width), dtype=torch.float32)
+    for k in range(tokens):
+        if frames == 1:
+            out[k] = m[0]
+            continue
+        f0 = min(frames_for_tokens(k), frames - 1)
+        f1 = max(f0 + 1, min(frames_for_tokens(k + 1), frames))
+        span = m[f0:f1]
+        out[k] = span.amin(0) if reduce == "min" else span.amax(0) if reduce == "max" else span.mean(0)
+    return out.clamp(0.0, 1.0)[None, None]
+
+
+class H3LatentMaskMerge:
+    """Merge two MiniMax H3 latents by a mask: black keeps latent_a, white takes latent_b.
+
+    Typical use: latent_a is the plate encoded with the H3 VAE, latent_b the
+    generated or upscaled shot; the face and anything that must match the
+    plate stay black. Both latents need the same video size. The mask may be a
+    single frame for the whole clip or one per frame; it is mapped onto H3's
+    latent tokens (1, 4, 4, 4, 4 frames) and blended in latent space, so give
+    it a soft edge of 32 px or more. set_noise_mask also attaches the mask, so
+    a sampler after this node redraws only the white area.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent_a": ("LATENT", {"tooltip": "Kept where the mask is black (e.g. the plate)."}),
+                "latent_b": ("LATENT", {"tooltip": "Taken where the mask is white (e.g. the generation)."}),
+                "mask": ("MASK", {"tooltip": "White = latent_b, black = latent_a. One frame or one per frame."}),
+                "temporal": (["min", "mean", "max"], {
+                    "default": "min",
+                    "tooltip": "How a latent token (4 frames) combines its mask frames. min: black in any "
+                               "frame keeps latent_a for the whole token; max: white in any frame takes latent_b.",
+                }),
+                "audio": (["latent_a", "latent_b"], {
+                    "default": "latent_a",
+                    "tooltip": "Which latent's audio part the result carries.",
+                }),
+                "set_noise_mask": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Attach the mask as noise_mask, so the next sampler redraws only the white area.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    FUNCTION = "merge"
+    CATEGORY = f"{CATEGORY}/latent"
+    DESCRIPTION = "Merge two MiniMax H3 latents by a mask: black keeps latent_a, white takes latent_b."
+
+    def merge(self, latent_a, latent_b, mask, temporal="min", audio="latent_a", set_noise_mask=False):
+        sa, sb = latent_a["samples"], latent_b["samples"]
+        nested = is_nested(sa)
+        if nested != is_nested(sb):
+            raise ValueError("one latent is an H3 video+audio latent and the other is not")
+        va, vb = (sa.tensors[0], sb.tensors[0]) if nested else (sa, sb)
+        if va.ndim != 5:
+            raise ValueError(f"expected a video latent [B, C, T, H, W], got {tuple(va.shape)}")
+        if tuple(va.shape) != tuple(vb.shape):
+            raise ValueError(
+                f"the video parts differ: latent_a {tuple(va.shape)}, latent_b {tuple(vb.shape)}; "
+                "encode both at the same size and frame count"
+            )
+
+        tokens, height, width = va.shape[2], va.shape[3], va.shape[4]
+        frames = frames_for_tokens(tokens)
+        if mask.ndim == 3 and mask.shape[0] not in (1, frames):
+            logging.warning("[H3 Latent Mask Merge] the mask has %d frames, the latent covers %d; "
+                            "tokens past the mask's end reuse its last frame", mask.shape[0], frames)
+        weight = mask_to_h3_latent(mask, tokens, height, width, temporal).to(va.device)
+        logging.info("[H3 Latent Mask Merge] mask %s -> latent %s, latent_a kept on %.1f%%",
+                     tuple(mask.shape), tuple(weight.shape[2:]), (weight < 0.5).float().mean().item() * 100)
+
+        a32 = va.float()
+        video = (a32 + (vb.to(va.device).float() - a32) * weight).to(va.dtype)
+
+        out = dict(latent_b if audio == "latent_b" else latent_a)
+        out.pop("noise_mask", None)
+        if nested:
+            rest = (sb if audio == "latent_b" else sa).tensors[1:]
+            out["samples"] = type(sa)([video, *rest])
+            if set_noise_mask:
+                out["noise_mask"] = type(sa)([weight, *[torch.zeros_like(r, dtype=torch.float32) for r in rest]])
+        else:
+            out["samples"] = video
+            if set_noise_mask:
+                out["noise_mask"] = weight
+        return (out,)
+
+
 NODE_CLASS_MAPPINGS = {
     "ToolsSaveLatentTo": SaveLatentTo,
     "ToolsLoadLatentFrom": LoadLatentFrom,
     "ToolsEncodeStillH3": EncodeStillH3,
+    "ToolsH3LatentMaskMerge": H3LatentMaskMerge,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ToolsSaveLatentTo": "Save Latent To (tools)",
     "ToolsLoadLatentFrom": "Load Latent From (tools)",
     "ToolsEncodeStillH3": "H3 Encode Still (tools)",
+    "ToolsH3LatentMaskMerge": "H3 Latent Mask Merge (tools)",
 }
