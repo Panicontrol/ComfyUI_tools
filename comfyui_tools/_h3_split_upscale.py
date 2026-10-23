@@ -645,13 +645,15 @@ class MMH3SplitUpscale(io.ComfyNode):
                 io.Int.Input("context", default=128, min=0, max=2048, step=32,
                              tooltip="around mask: px kept around a blob inside its square, so the square's edge "
                                      "lies in the frozen area."),
-                io.Int.Input("mask_grow", default=16, min=-256, max=256, step=1,
+                io.Int.Input("mask_grow", default=32, min=-256, max=256, step=1,
                              tooltip="Widen (+) or shrink (-) the white area by this many px of the latent's frame, "
-                                     "before feathering, so the whole object stays fully redrawn."),
+                                     "before feathering. Half of the feather falls inside the grown edge, so keep "
+                                     "grow >= feather for the object's own edge to be fully redrawn; more for a "
+                                     "fast, motion-blurred object."),
                 io.Int.Input("mask_feather", default=32, min=0, max=256, step=1,
-                             tooltip="Soft edge in px of the latent's frame. A latent cell is 16 px, so 32+ spreads "
-                                     "the hand-over to the plate over several cells and hides the seam. 0 if the "
-                                     "mask is already feathered."),
+                             tooltip="Gaussian radius of the soft edge, px of the latent's frame: the hand-over to "
+                                     "the plate runs about 2x this wide, centred on the grown edge (32 -> ~64 px, "
+                                     "4 latent cells). 0 if the mask is already feathered."),
             ],
             outputs=[io.Latent.Output("latent")],
         )
@@ -661,7 +663,7 @@ class MMH3SplitUpscale(io.ComfyNode):
                 negative=None, cfg=1.0, temporal_split_param=None,
                 spatial_split_param=None, seam_polish="off",
                 color_match=True, mask=None, skip_frozen_tiles=True, tiles="grid",
-                tile_size=768, context=128, mask_grow=16, mask_feather=32) -> io.NodeOutput:
+                tile_size=768, context=128, mask_grow=32, mask_feather=32) -> io.NodeOutput:
         samples = latent["samples"]
         if not is_h3_av_latent(samples):
             raise ValueError("期望 MiniMax H3 AV latent (嵌套 video+audio)")
