@@ -645,6 +645,13 @@ class MMH3SplitUpscale(io.ComfyNode):
                 io.Int.Input("context", default=128, min=0, max=2048, step=32,
                              tooltip="around mask: px kept around a blob inside its square, so the square's edge "
                                      "lies in the frozen area."),
+                io.Int.Input("mask_grow", default=16, min=-256, max=256, step=1,
+                             tooltip="Widen (+) or shrink (-) the white area by this many px of the latent's frame, "
+                                     "before feathering, so the whole object stays fully redrawn."),
+                io.Int.Input("mask_feather", default=32, min=0, max=256, step=1,
+                             tooltip="Soft edge in px of the latent's frame. A latent cell is 16 px, so 32+ spreads "
+                                     "the hand-over to the plate over several cells and hides the seam. 0 if the "
+                                     "mask is already feathered."),
             ],
             outputs=[io.Latent.Output("latent")],
         )
@@ -654,7 +661,7 @@ class MMH3SplitUpscale(io.ComfyNode):
                 negative=None, cfg=1.0, temporal_split_param=None,
                 spatial_split_param=None, seam_polish="off",
                 color_match=True, mask=None, skip_frozen_tiles=True, tiles="grid",
-                tile_size=768, context=128) -> io.NodeOutput:
+                tile_size=768, context=128, mask_grow=16, mask_feather=32) -> io.NodeOutput:
         samples = latent["samples"]
         if not is_h3_av_latent(samples):
             raise ValueError("期望 MiniMax H3 AV latent (嵌套 video+audio)")
@@ -665,7 +672,15 @@ class MMH3SplitUpscale(io.ComfyNode):
 
         umask = None
         if mask is not None:
-            umask = build_user_mask(mask, T, H, W, video.device)
+            from .latent_nodes import mask_to_h3_latent
+
+            # grow / feather are px of the latent's frame; the mask may be smaller (drawn on the plate
+            # before the upscale), so they are scaled to its pixels
+            scale = mask.shape[-1] / (W * VAE_DOWNSAMPLE)
+            umask = mask_to_h3_latent(mask, T, H, W, "min", round(mask_grow * scale),
+                                      round(mask_feather * scale)).to(video.device)
+            if mask_grow or mask_feather:
+                print(f"[H3] [MASK] grow {mask_grow} px, feather {mask_feather} px")
             n_frames = frames_for_tokens(T)
             if mask.dim() == 3 and mask.shape[0] not in (1, n_frames):
                 print(f"[H3] [MASK] WARNING: mask has {mask.shape[0]} frames, latent "
