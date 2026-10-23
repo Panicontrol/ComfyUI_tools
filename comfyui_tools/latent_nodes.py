@@ -11,6 +11,7 @@ safetensors file (``.latent``) and rebuild it exactly on load.
 import json
 import logging
 import os
+import re
 
 import torch
 
@@ -717,6 +718,92 @@ class H3LatentDiffMask:
         return (mask, heat, info)
 
 
+def parse_frame_list(text, total):
+    """'0, 24, 48-60, 0-123:24, -1' -> sorted unique frame indices within [0, total)."""
+    frames = set()
+    for part in re.split(r"[,;\s]+", str(text).strip()):
+        if not part:
+            continue
+        m = re.fullmatch(r"(-?\d+)(?:-(-?\d+))?(?::(\d+))?", part)
+        if not m:
+            raise ValueError(f"frames: cannot read '{part}'; use e.g. 0, 24, 48-60, 0-123:24, -1")
+        a = int(m.group(1))
+        b = int(m.group(2)) if m.group(2) is not None else a
+        step = max(1, int(m.group(3) or 1))
+        a, b = (a + total if a < 0 else a), (b + total if b < 0 else b)
+        frames.update(f for f in range(a, b + 1, step) if 0 <= f < total)
+    if not frames:
+        raise ValueError(f"frames: nothing in range 0-{total - 1}")
+    return sorted(frames)
+
+
+class H3DecodeFrames:
+    """Decode only the frames you want to look at from a MiniMax H3 latent.
+
+    The H3 VAE decodes 17-frame groups (5 latent tokens), each blended over
+    its first ~5 frames with the tail of the group before. This node decodes
+    just the groups holding the requested frames -- with the group before as
+    context when exact is on, so the frames match a full VAE Decode -- and
+    returns those frames as an IMAGE batch. A frame or two from a 124-frame
+    shot costs about two groups instead of eight.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "vae": ("VAE", {"tooltip": "The MiniMax H3 video VAE."}),
+                "latent": ("LATENT",),
+                "frames": ("STRING", {
+                    "default": "0, -1",
+                    "tooltip": "Frame numbers from 0: '0, 24, 48-60' ranges, '0-123:24' every 24th, "
+                               "'-1' the last frame.",
+                }),
+                "exact": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Decode the group before as context, so each frame matches a full decode. "
+                               "Off: faster, the first ~5 frames of a group differ slightly.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "frames")
+    FUNCTION = "decode"
+    CATEGORY = f"{CATEGORY}/latent"
+    DESCRIPTION = "Decode only selected frames of a MiniMax H3 latent, for a quick look."
+
+    def decode(self, vae, latent, frames="0, -1", exact=True):
+        samples = latent["samples"]
+        video = samples.tensors[0] if is_nested(samples) else samples
+        if video.ndim != 5:
+            raise ValueError(f"expected a video latent [B, C, T, H, W], got {tuple(video.shape)}")
+        tokens = video.shape[2]
+        total = frames_for_tokens(tokens)
+        wanted = parse_frame_list(frames, total)
+
+        # runs of consecutive 17-frame groups, decoded one run at a time
+        groups = sorted({f // H3_CLIP for f in wanted})
+        runs, start = [], groups[0]
+        for prev, g in zip(groups, groups[1:] + [None]):
+            if g != prev + 1:
+                runs.append((start, prev))
+                start = g
+        images = {}
+        for first, last in runs:
+            ctx = max(0, first - 1) if exact else first
+            k0, k1 = ctx * 5, min(tokens, (last + 1) * 5 + 2)  # +2: the overlap tokens the VAE reads ahead
+            out = vae.decode(video[:, :, k0:k1])
+            out = out.reshape(-1, *out.shape[-3:]) if out.ndim == 5 else out
+            base = ctx * H3_CLIP
+            for f in wanted:
+                if first <= f // H3_CLIP <= last:
+                    images[f] = out[f - base]
+        logging.info("[H3 Decode Frames] %d frames from %d of %d tokens", len(wanted),
+                     sum(min(tokens, (b + 1) * 5 + 2) - (max(0, a - 1) if exact else a) * 5 for a, b in runs), tokens)
+        return (torch.stack([images[f] for f in wanted]), ", ".join(map(str, wanted)))
+
+
 NODE_CLASS_MAPPINGS = {
     "ToolsSaveLatentTo": SaveLatentTo,
     "ToolsLoadLatentFrom": LoadLatentFrom,
@@ -725,6 +812,7 @@ NODE_CLASS_MAPPINGS = {
     "ToolsH3LatentCrop": H3LatentCrop,
     "ToolsH3LatentPaste": H3LatentPaste,
     "ToolsH3LatentDiffMask": H3LatentDiffMask,
+    "ToolsH3DecodeFrames": H3DecodeFrames,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -735,4 +823,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ToolsH3LatentCrop": "H3 Latent Crop (tools)",
     "ToolsH3LatentPaste": "H3 Latent Paste (tools)",
     "ToolsH3LatentDiffMask": "H3 Latent Diff Mask (tools)",
+    "ToolsH3DecodeFrames": "H3 Decode Frames (tools)",
 }

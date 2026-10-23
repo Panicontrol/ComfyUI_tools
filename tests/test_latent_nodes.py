@@ -185,3 +185,27 @@ def test_h3_diff_mask_finds_the_edit_not_the_drift():
     assert float(mask[30, 16, 16]) == 0.0       # drifted but unedited
     assert float(mask[10, 64, 128]) == 0.0      # same place before the edit starts (token 3)
     assert "auto" in info
+
+
+def test_h3_decode_frames_picks_frames_from_partial_decodes():
+    from comfyui_tools.latent_nodes import H3DecodeFrames, frames_for_tokens, parse_frame_list
+
+    assert parse_frame_list("0, 5-7, 0-40:20, -1", 124) == [0, 5, 6, 7, 20, 40, 123]
+
+    class TokenVAE:  # each frame shows the absolute index of its token (channel 0 holds it)
+        calls = []
+
+        def decode(self, z):
+            self.calls.append(z.shape[2])
+            ids = z[0, 0, :, 0, 0]
+            frames = [ids[k] for k in range(z.shape[2]) for _ in range(1 if k % 5 == 0 else 4)]
+            return torch.stack(frames).view(1, -1, 1, 1, 1).expand(1, -1, 2, 2, 3)
+
+    tokens = 37  # 124 frames
+    z = torch.arange(tokens, dtype=torch.float32).view(1, 1, tokens, 1, 1).expand(1, 24, tokens, 1, 1)
+    vae = TokenVAE()
+    images, frames = H3DecodeFrames().decode(vae, {"samples": z}, "100, 3, -1", exact=True)
+    owner = [k for k in range(tokens) for _ in range(frames_for_tokens(k + 1) - frames_for_tokens(k))]
+    assert frames == "3, 100, 123"
+    assert [int(images[i, 0, 0, 0]) for i in range(3)] == [owner[3], owner[100], owner[123]]
+    assert sum(vae.calls) < tokens  # never the whole latent
