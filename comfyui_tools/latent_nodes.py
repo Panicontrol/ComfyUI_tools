@@ -10,6 +10,7 @@ safetensors file (``.latent``) and rebuild it exactly on load.
 
 import json
 import logging
+import math
 import os
 import re
 
@@ -420,15 +421,142 @@ def mask_bbox(mask, threshold=0.5):
     return x0, y0, x1 - x0, y1 - y0
 
 
+H3_CROP_ASPECTS = ["free", "1:1", "16:9", "9:16", "4:3", "3:4", "match latent"]
+H3_COMFORT_SIDE = 512  # H3 trained around 768 px on the short side; much smaller crops sample poorly
+
+
+def h3_frame_range(tokens, start_frame, length):
+    """(f0, f1, token0, tokens) for a crop starting at start_frame, snapped to H3's 17k+5 grid."""
+    frames = frames_for_tokens(tokens)
+    f0 = min(max(0, start_frame) // H3_CLIP * H3_CLIP, max(0, frames - 5) // H3_CLIP * H3_CLIP)
+    k0 = f0 // H3_CLIP * 5
+    available = tokens - k0
+    n = available if length <= 0 else min(available, (max(length, 5) - 5 + H3_CLIP - 1) // H3_CLIP * 5 + 2)
+    return f0, frames_for_tokens(k0 + n), k0, n
+
+
+def mask_work_grid(mask, height, width, threshold=0.5, despeckle=0):
+    """The mask on a 4 px grid of the latent's pixel size, thresholded, specks removed.
+
+    Returns a bool [F, height/4, width/4]. Frames go through a few at a time,
+    so a long full-HD mask stays small; a crop snaps to 32 px anyway.
+    """
+    import torch.nn.functional as F
+
+    m = mask if mask.ndim == 3 else mask[None]
+    gh, gw = max(1, height // 4), max(1, width // 4)
+    r = int(round(despeckle / 4))
+    out = []
+    for start in range(0, m.shape[0], 8):
+        part = m[start:start + 8].float()[:, None]
+        if tuple(part.shape[2:]) != (gh * 4, gw * 4):
+            part = F.interpolate(part, size=(gh * 4, gw * 4), mode="bilinear", align_corners=False)
+        # a cell counts if any of its pixels does, so the object's edge is never cut
+        hit = F.max_pool2d((part > threshold).float(), 4)
+        if r > 0:  # opening: whatever is thinner than 2 * despeckle px disappears
+            k = 2 * r + 1
+            hit = F.max_pool2d(-F.max_pool2d(-hit, k, 1, r), k, 1, r)
+        out.append(hit[:, 0] > 0.5)
+    return torch.cat(out)
+
+
+def grid_bbox(hit):
+    """(x0, y0, x1, y1) in grid cells of the union of a bool [F, h, w], or None."""
+    union = hit.any(0)
+    rows, cols = union.any(1).nonzero(), union.any(0).nonzero()
+    if len(rows) == 0:
+        return None
+    return int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1
+
+
+def fit_box(bx0, by0, bx1, by1, full_w, full_h, aspect="free", min_size=0):
+    """Grow a box to an aspect ratio and a minimum short side around its centre, kept in frame."""
+    w, h = bx1 - bx0, by1 - by0
+    ratio = {"1:1": 1.0, "16:9": 16 / 9, "9:16": 9 / 16, "4:3": 4 / 3, "3:4": 3 / 4,
+             "match latent": full_w / full_h}.get(aspect)
+    if ratio:
+        if w / h < ratio:
+            w = h * ratio
+        else:
+            h = w / ratio
+    if min_size > 0 and min(w, h) < min_size:
+        scale = min_size / min(w, h)
+        w, h = w * scale, h * scale
+    w, h = min(w, full_w), min(h, full_h)  # past the frame the aspect gives way
+    cx, cy = (bx0 + bx1) / 2, (by0 + by1) / 2
+    x0 = min(max(0.0, cx - w / 2), full_w - w)
+    y0 = min(max(0.0, cy - h / 2), full_h - h)
+    return x0, y0, x0 + w, y0 + h
+
+
+def snap_box_to_grid(x0, y0, x1, y1, full_w, full_h, aspect="free"):
+    """Widen a box outward to the 32 px grid, then add 32 px steps to the side the aspect
+    ratio is short on, split around the box, until the ratio is as close as the grid allows."""
+    edge_w, edge_h = full_w // 32 * 32, full_h // 32 * 32
+    x0, y0 = int(x0) // 32 * 32, int(y0) // 32 * 32
+    x1, y1 = min(edge_w, -(-int(x1) // 32) * 32), min(edge_h, -(-int(y1) // 32) * 32)
+    ratio = {"1:1": 1.0, "16:9": 16 / 9, "9:16": 9 / 16, "4:3": 4 / 3, "3:4": 3 / 4,
+             "match latent": full_w / full_h}.get(aspect)
+    if not ratio:
+        return x0, y0, x1, y1
+
+    def miss(w, h):
+        return abs(math.log(w / h / ratio))
+
+    def grow(a, b, limit):  # 32 px more, on the side with room, alternating
+        if (b - a) // 32 % 2 == 0 and a > 0 or b >= limit:
+            return a - 32, b
+        return a, b + 32
+
+    for _ in range(512):
+        w, h = x1 - x0, y1 - y0
+        if w / h < ratio and w < edge_w and miss(w + 32, h) < miss(w, h):
+            x0, x1 = grow(x0, x1, edge_w)
+        elif w / h > ratio and h < edge_h and miss(w, h + 32) < miss(w, h):
+            y0, y1 = grow(y0, y1, edge_h)
+        else:
+            break
+    return max(0, x0), max(0, y0), x1, y1
+
+
+def crop_preview(base, union, obj_box, crop_box, width, height):
+    """An IMAGE [1, H, W, 3]: the frame (or the mask), the mask tinted, object box green, crop box yellow."""
+    from PIL import Image, ImageDraw
+    import numpy as np
+
+    scale = min(1.0, 1024 / max(width, height))
+    pw, ph = max(1, int(width * scale)), max(1, int(height * scale))
+    mask_img = Image.fromarray((union.float().numpy() * 255).astype(np.uint8)).resize((pw, ph))
+    if base is not None:
+        frame = (base.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+        img = Image.fromarray(frame[..., :3]).resize((pw, ph))
+        red = Image.new("RGB", (pw, ph), (255, 40, 40))
+        img = Image.composite(red, img, mask_img.point(lambda v: int(v * 0.4)))
+    else:
+        img = Image.merge("RGB", [mask_img.point(lambda v: v // 2 + 30)] * 3)
+    draw = ImageDraw.Draw(img)
+    line = max(2, int(3 * scale + 1))
+    if obj_box is not None:
+        draw.rectangle([c * scale for c in obj_box], outline=(60, 230, 90), width=line)
+    draw.rectangle([c * scale for c in crop_box], outline=(255, 210, 40), width=line)
+    return torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0)[None]
+
+
 class H3LatentCrop:
     """Crop a MiniMax H3 latent in space and time, keeping it a valid H3 latent.
 
     H3 needs sides that are multiples of 32 px (2x2 latent cells) and clips of
     17k + 5 frames that start where the VAE starts a 17-frame group, so the box
     is widened outward to the 32 px grid and the frames snap to that grid. The
-    audio part is cut to the same frames. Connect a mask to crop around its
-    white area (plus padding) instead of x/y/width/height. The crop output
-    carries where the piece came from, for H3 Latent Paste.
+    audio part is cut to the same frames. The crop output carries where the
+    piece came from, for H3 Latent Paste.
+
+    With a mask the box is the union of its white area over the cropped frames
+    (threshold, despeckle), plus padding in pixels and in percent of the
+    object, optionally grown to an aspect ratio and a minimum size around the
+    object's centre. time_from_mask also takes the frames from the mask: only
+    where it is white, plus time_padding. The box stays fixed for the whole
+    piece -- a latent is one rectangle, so a crop cannot follow the object.
     """
 
     @classmethod
@@ -447,51 +575,92 @@ class H3LatentCrop:
                 "length": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 17,
                                    "tooltip": "Frames, snapped up to 17k + 5; 0 = to the end."}),
             },
+            # after the original widgets, so saved workflows keep their values in place
             "optional": {
-                "mask": ("MASK", {"tooltip": "Crop around the white area of any frame instead of x/y/width/height."}),
+                "mask": ("MASK", {"tooltip": "Crop around the white area instead of x/y/width/height."}),
                 "padding": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 8,
                                     "tooltip": "Pixels added around the mask's white area."}),
+                "threshold": ("FLOAT", {"default": 0.5, "min": 0.01, "max": 1.0, "step": 0.01,
+                                        "tooltip": "Mask value that counts as white."}),
+                "despeckle": ("INT", {"default": 0, "min": 0, "max": 256, "step": 4,
+                                      "tooltip": "Ignore specks and strands thinner than about 2x this many "
+                                                 "pixels (stray bits of a SAM mask), so they do not stretch the box."}),
+                "padding_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 500.0, "step": 1.0,
+                                              "tooltip": "Extra margin on each side, in percent of the object's "
+                                                         "width / height; added to padding."}),
+                "time_from_mask": ("BOOLEAN", {"default": False,
+                                               "tooltip": "Take the frames from the mask: only where it is white "
+                                                          "(plus time_padding), instead of start_frame / length. "
+                                                          "Needs a mask with one frame per video frame."}),
+                "time_padding": ("INT", {"default": 8, "min": 0, "max": 1000, "step": 1,
+                                         "tooltip": "Frames kept before and after the white frames with "
+                                                    "time_from_mask; then snapped to H3's grid."}),
+                "aspect_ratio": (H3_CROP_ASPECTS, {"default": "free",
+                                                   "tooltip": "Grow the box to this shape around the object. "
+                                                              "free = just the object plus padding."}),
+                "min_size": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 32,
+                                     "tooltip": "Grow the box so its short side is at least this many pixels "
+                                                "(0 = off). H3 works best around 768."}),
+                "image": ("IMAGE", {"tooltip": "The shot's frames, only to draw the preview on."}),
             },
         }
 
-    RETURN_TYPES = ("LATENT", "H3_CROP", "MASK", "STRING")
-    RETURN_NAMES = ("latent", "crop", "mask", "info")
+    RETURN_TYPES = ("LATENT", "H3_CROP", "MASK", "STRING", "IMAGE")
+    RETURN_NAMES = ("latent", "crop", "mask", "info", "preview")
     FUNCTION = "crop"
     CATEGORY = f"{CATEGORY}/latent"
     DESCRIPTION = "Crop a MiniMax H3 latent to a 32 px box and an H3 frame range; paste it back with H3 Latent Paste."
 
-    def crop(self, latent, x, y, width, height, start_frame, length, mask=None, padding=64):
+    def crop(self, latent, x, y, width, height, start_frame, length, mask=None, padding=64, threshold=0.5,
+             despeckle=0, padding_percent=0.0, time_from_mask=False, time_padding=8, aspect_ratio="free",
+             min_size=0, image=None):
         samples, video, audio = h3_av_parts(latent, "latent")
         tokens, cells_h, cells_w = video.shape[2], video.shape[3], video.shape[4]
         full_w, full_h, frames = cells_w * 16, cells_h * 16, frames_for_tokens(tokens)
+        notes = []
 
+        hit = None
         if mask is not None:
-            box = mask_bbox(mask)
-            if box is None:
-                raise ValueError("the mask is empty: nothing to crop around")
-            sx, sy = full_w / mask.shape[-1], full_h / mask.shape[-2]  # mask may be another size
-            bx, by, bw, bh = box
-            x, y = int((bx - padding) * sx), int((by - padding) * sy)
-            width, height = int((bw + 2 * padding) * sx + 0.999), int((bh + 2 * padding) * sy + 0.999)
-        x, y = max(0, x), max(0, y)
-        x1 = full_w if width <= 0 else min(full_w, x + width)
-        y1 = full_h if height <= 0 else min(full_h, y + height)
+            hit = mask_work_grid(mask, full_h, full_w, threshold, despeckle)  # [Fm, full_h/4, full_w/4]
+            if hit.shape[0] > 1 and hit.shape[0] != frames:
+                notes.append(f"! the mask has {hit.shape[0]} frames, the latent {frames}; matched from frame 0")
+        if time_from_mask:
+            if hit is None or hit.shape[0] == 1:
+                notes.append("time_from_mask needs a mask with one frame per video frame; used start_frame / length")
+            else:
+                white = hit.flatten(1).any(1).nonzero()
+                if len(white) == 0:
+                    raise ValueError("the mask is empty in every frame: nothing to crop around")
+                first, last = int(white[0]), int(white[-1])
+                notes.append(f"mask is white in frames {first}-{last}")
+                start_frame = max(0, first - time_padding)
+                length = min(frames - 1, last + time_padding) - start_frame // H3_CLIP * H3_CLIP + 1
+        f0, f1, k0, n = h3_frame_range(tokens, start_frame, length)
+
+        obj_box = None
+        if hit is not None:
+            in_range = hit if hit.shape[0] == 1 else hit[min(f0, hit.shape[0] - 1):f1]
+            cells = grid_bbox(in_range)
+            if cells is None:
+                raise ValueError(f"the mask is empty in frames {f0}-{f1 - 1}: nothing to crop around")
+            obj_box = tuple(c * 4 for c in cells)  # grid cell = 4 px
+            bx0, by0, bx1, by1 = obj_box
+            px = padding + padding_percent / 100 * (bx1 - bx0)
+            py = padding + padding_percent / 100 * (by1 - by0)
+            box = (max(0, bx0 - px), max(0, by0 - py), min(full_w, bx1 + px), min(full_h, by1 + py))
+            box = fit_box(*box, full_w, full_h, aspect_ratio, min_size)
+            x, y, x1, y1 = int(box[0]), int(box[1]), int(box[2] + 0.999), int(box[3] + 0.999)
+            x, y, x1, y1 = snap_box_to_grid(x, y, x1, y1, full_w, full_h, aspect_ratio)
+        else:
+            x, y = max(0, x), max(0, y)
+            x1 = full_w if width <= 0 else min(full_w, x + width)
+            y1 = full_h if height <= 0 else min(full_h, y + height)
         # widen outward to the 32 px grid H3 patches on
         c0, r0 = x // 32 * 2, y // 32 * 2
         c1, r1 = min(cells_w, -(-x1 // 32) * 2), min(cells_h, -(-y1 // 32) * 2)
         if c1 <= c0 or r1 <= r0:
             raise ValueError(f"the box is outside the {full_w}x{full_h} latent")
-
-        f0 = min(start_frame // H3_CLIP * H3_CLIP, max(0, frames - 5) // H3_CLIP * H3_CLIP)
-        k0 = f0 // H3_CLIP * 5
-        available = tokens - k0
-        if length > 0:
-            n = (max(length, 5) - 5 + H3_CLIP - 1) // H3_CLIP * 5 + 2
-            n = min(n, available)
-        else:
-            n = available
         k1 = k0 + n
-        f1 = frames_for_tokens(k1)
 
         cut_video = video[:, :, k0:k1, r0:r1, c0:c1].contiguous()
         cut_audio = audio[..., audio_index(f0):min(audio.shape[-1], audio_index(f1))].contiguous()
@@ -506,6 +675,7 @@ class H3LatentCrop:
         crop = {"x": c0 * 16, "y": r0 * 16, "width": (c1 - c0) * 16, "height": (r1 - r0) * 16,
                 "start_frame": f0, "frames": f1 - f0, "token0": k0, "tokens": n,
                 "full_width": full_w, "full_height": full_h, "full_frames": frames}
+        crop_box = (crop["x"], crop["y"], crop["x"] + crop["width"], crop["y"] + crop["height"])
         if mask is not None:
             m = mask if mask.ndim == 3 else mask[None]
             if tuple(m.shape[1:]) != (full_h, full_w):
@@ -516,10 +686,31 @@ class H3LatentCrop:
             cut_mask = m[:, r0 * 16:r1 * 16, c0 * 16:c1 * 16]
         else:
             cut_mask = torch.ones((1, (r1 - r0) * 16, (c1 - c0) * 16))
-        info = (f"{crop['width']}x{crop['height']} at {crop['x']},{crop['y']} of {full_w}x{full_h}; "
-                f"frames {f0}-{f1 - 1} ({f1 - f0}) of {frames}")
-        logging.info("[H3 Latent Crop] %s", info)
-        return (out, crop, cut_mask, info)
+
+        lines = [f"crop {crop['width']}x{crop['height']} at {crop['x']},{crop['y']} of {full_w}x{full_h}; "
+                 f"frames {f0}-{f1 - 1} ({f1 - f0}) of {frames}"]
+        if obj_box is not None:
+            ow, oh = obj_box[2] - obj_box[0], obj_box[3] - obj_box[1]
+            cover = ow * oh / (crop["width"] * crop["height"])
+            lines.append(f"object {ow}x{oh} at {obj_box[0]},{obj_box[1]}: its box fills {cover:.0%} of the crop, "
+                         f"the mask itself {float((cut_mask > threshold).float().mean()):.0%}")
+        if min(crop["width"], crop["height"]) < H3_COMFORT_SIDE:
+            lines.append(f"! short side {min(crop['width'], crop['height'])} px: H3 works best around 768; "
+                         "raise min_size or crop in pixels and upscale")
+        lines += notes
+        info = "\n".join(lines)
+        logging.info("[H3 Latent Crop] %s", info.replace("\n", "; "))
+
+        union = (in_range.any(0) if hit is not None else torch.zeros((full_h // 4, full_w // 4), dtype=torch.bool))
+        base = None
+        if image is not None:
+            base = image[min((f0 + f1) // 2, image.shape[0] - 1)]
+            if tuple(base.shape[:2]) != (full_h, full_w):
+                from .utils import resize_image
+
+                base = resize_image(base[None, ..., :3], full_w, full_h, "bilinear")[0]
+        preview = crop_preview(base, union, obj_box, crop_box, full_w, full_h)
+        return (out, crop, cut_mask, info, preview)
 
 
 class H3LatentPaste:

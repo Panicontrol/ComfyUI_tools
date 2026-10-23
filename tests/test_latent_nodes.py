@@ -141,7 +141,7 @@ def test_h3_crop_snaps_to_the_h3_grid_and_pastes_back():
     from comfyui_tools.latent_nodes import H3LatentCrop, H3LatentPaste
 
     base = h3_latent()  # 12 tokens = 39 frames, 192x128 px
-    piece, crop, mask, info = H3LatentCrop().crop(base, 40, 20, 50, 40, 20, 10)
+    piece, crop, mask, info, _ = H3LatentCrop().crop(base, 40, 20, 50, 40, 20, 10)
     # box widened to the 32 px grid, frames snapped to start 17 and length 22 (17 + 5)
     assert (crop["x"], crop["y"], crop["width"], crop["height"]) == (32, 0, 64, 64)
     assert (crop["start_frame"], crop["frames"], crop["token0"], crop["tokens"]) == (17, 22, 5, 7)
@@ -164,7 +164,7 @@ def test_h3_crop_around_a_mask():
 
     mask = torch.zeros(1, 128, 192)
     mask[:, 70:90, 100:120] = 1.0
-    _, crop, cut, _ = H3LatentCrop().crop(h3_latent(), 0, 0, 0, 0, 0, 0, mask=mask, padding=8)
+    _, crop, cut, _, _ = H3LatentCrop().crop(h3_latent(), 0, 0, 0, 0, 0, 0, mask=mask, padding=8)
     assert (crop["x"], crop["y"], crop["width"], crop["height"]) == (64, 32, 64, 96)
     assert crop["frames"] == 39 and float(cut.max()) == 1.0
 
@@ -224,3 +224,26 @@ def test_latent_info_reads_h3_and_flags_problems():
     odd = {"samples": FakeNested([torch.full((1, 24, 3, 5, 6), float("nan")), torch.zeros(1, 32, 2, 10)])}
     text = LatentInfo().inspect(odd)["result"][1]
     assert "NOT on the 17k+5 grid" in text and "not multiples of 32 px" in text and "all NaN/Inf" in text
+
+
+def test_h3_crop_extended_mask_options():
+    from comfyui_tools.latent_nodes import H3LatentCrop
+
+    latent = h3_latent(tokens=37, rows=34, cols=60)  # 124 frames, 960x544 px
+    mask = torch.zeros(124, 544, 960)
+    mask[40:70, 200:296, 400:464] = 1.0      # the object: 64x96 px, frames 40-69
+    mask[:, 10:14, 10:14] = 1.0              # a 4 px speck in every frame
+
+    _, crop, cut, info, preview = H3LatentCrop().crop(
+        latent, 0, 0, 0, 0, 0, 0, mask=mask, padding=0, despeckle=8, padding_percent=50,
+        time_from_mask=True, time_padding=4, aspect_ratio="1:1", min_size=256)
+    # frames: white 40-69, +-4 -> 36-73, snapped to start 34, 17k+5 long
+    assert (crop["start_frame"], crop["frames"]) == (34, 56) and cut.shape[0] == 56
+    # box: object + 50% each side = 128x192, square 192, min 256 -> 256x256 around (432, 248), on the 32 px grid
+    assert (crop["width"], crop["height"]) == (288, 288) and (crop["x"], crop["y"]) == (288, 96)
+    assert "short side 288 px" in info and "white in frames 40-69" in info
+    assert preview.shape == (1, 544, 960, 3)
+
+    # without time_from_mask the box only looks at the frames being cropped: frames 0-21 have just the speck
+    with pytest.raises(ValueError, match="empty in frames 0-21"):
+        H3LatentCrop().crop(latent, 0, 0, 0, 0, 0, 22, mask=mask, despeckle=8)
