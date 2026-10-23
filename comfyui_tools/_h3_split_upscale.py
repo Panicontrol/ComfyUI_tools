@@ -316,6 +316,72 @@ def compute_spatial_grid(h, w, th, tw, ol_h, ol_w, min_th=0, min_tw=0):
     cols, tcols, col_ovl = _grid_1d(w, tw, ol_w, min_tw)
     return rows, cols, trows, tcols, row_ovl, col_ovl
 
+def _square_window(b0, b1, dim, size):
+    """Start of a size-long window (even cells) around [b0, b1), kept inside [0, dim)."""
+    size = min(size, dim - dim % ALIGN if dim >= ALIGN else dim)
+    start = snap_align((b0 + b1) / 2 - size / 2)
+    start = min(start, b0 - b0 % ALIGN)          # cover the start of the area
+    start = max(start, b1 - size + (b1 - size) % ALIGN)  # and its end, rounding up onto the grid
+    start = max(0, min(start, dim - size))
+    return start - start % ALIGN, size
+
+
+def mask_tile_plan(um_chunk, tile_h, tile_w, ctx, lp, H, W):
+    """Tiles around the white areas of a chunk's mask instead of a frame grid.
+
+    um_chunk: [T, H, W] latent mask of the chunk. Every white blob (union over the
+    chunk's tokens) plus ctx cells of context gets one tile_h x tile_w window centred
+    on it; a blob too big for one window gets its own small grid with lp's overlaps.
+    Windows that would overlap are merged first. Returns (tiles, windows): tiles as
+    (group, ri, cj, r0, c0, tr, tc, ovh, ovw) in latent cells, windows as (r0, c0, h, w).
+    """
+    union = (um_chunk > FROZEN_EPS).any(0)
+    if not bool(union.any()):
+        return [], []
+    try:
+        from scipy import ndimage
+        labels, count = ndimage.label(union.cpu().numpy())
+        boxes = [(int(sl[0].start), int(sl[0].stop), int(sl[1].start), int(sl[1].stop))
+                 for sl in ndimage.find_objects(labels) if sl is not None]
+    except Exception:  # no scipy: one window over all the white
+        rr, cc = union.any(1).nonzero(), union.any(0).nonzero()
+        boxes = [(int(rr[0]), int(rr[-1]) + 1, int(cc[0]), int(cc[-1]) + 1)]
+    areas = [(max(0, r0 - ctx), min(H, r1 + ctx), max(0, c0 - ctx), min(W, c1 + ctx)) for r0, r1, c0, c1 in boxes]
+
+    def window(a):
+        # the area widened outward to the 32 px grid, so an aligned window can always hold it
+        a = (a[0] - a[0] % ALIGN, a[1] + a[1] % ALIGN, a[2] - a[2] % ALIGN, a[3] + a[3] % ALIGN)
+        r0, h = _square_window(a[0], a[1], H, max(tile_h, a[1] - a[0]))
+        c0, w = _square_window(a[2], a[3], W, max(tile_w, a[3] - a[2]))
+        return r0, c0, h, w
+
+    merged = True
+    while merged:  # windows that would overlap become one area
+        merged = False
+        wins = [window(a) for a in areas]
+        for x in range(len(areas)):
+            for y in range(x + 1, len(areas)):
+                (ar, ac, ah, aw), (br, bc, bh, bw) = wins[x], wins[y]
+                if ar < br + bh and br < ar + ah and ac < bc + bw and bc < ac + aw:
+                    a, b = areas[x], areas[y]
+                    areas[x] = (min(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), max(a[3], b[3]))
+                    del areas[y]
+                    merged = True
+                    break
+            if merged:
+                break
+    wins = sorted(window(a) for a in areas)
+    tiles = []
+    for g, (wr, wc, wh, ww) in enumerate(wins):
+        th, tw = min(tile_h, wh), min(tile_w, ww)
+        rows, trows, rovl = _grid_1d(wh, th, min(lp["ol_h"], max(0, th - ALIGN)), lp["mt"])
+        cols, tcols, covl = _grid_1d(ww, tw, min(lp["ol_w"], max(0, tw - ALIGN)), lp["mt"])
+        for ri in range(len(rows)):
+            for cj in range(len(cols)):
+                tiles.append((g, ri, cj, wr + rows[ri], wc + cols[cj], trows[ri], tcols[cj], rovl[ri], covl[cj]))
+    return tiles, wins
+
+
 def spatial_fade_mask(tile_h, tile_w, ovh, ovw, done_top, done_left,
                       fade_h=0, fade_w=0, seam_cap=1.0):
     """1=自由重采样, 0=冻结。
@@ -569,6 +635,16 @@ class MMH3SplitUpscale(io.ComfyNode):
                 io.Boolean.Input("skip_frozen_tiles", default=True,
                                  tooltip="Do not sample tiles and seams the mask leaves all black: same "
                                          "result, faster. Only with a mask."),
+                io.Combo.Input("tiles", options=["grid", "around mask"], default="grid",
+                               tooltip="grid: tiles over the whole frame (spatial_split_param). around mask: per "
+                                       "temporal chunk, one tile_size square centred on every white blob of the "
+                                       "mask (plus context); a blob too big for it gets its own small grid. "
+                                       "Needs a mask."),
+                io.Int.Input("tile_size", default=768, min=256, max=4096, step=32,
+                             tooltip="around mask: side of the square, px. H3 works best around 768."),
+                io.Int.Input("context", default=128, min=0, max=2048, step=32,
+                             tooltip="around mask: px kept around a blob inside its square, so the square's edge "
+                                     "lies in the frozen area."),
             ],
             outputs=[io.Latent.Output("latent")],
         )
@@ -577,7 +653,8 @@ class MMH3SplitUpscale(io.ComfyNode):
     def execute(cls, latent, conditioning, model, noise, sampler, sigmas,
                 negative=None, cfg=1.0, temporal_split_param=None,
                 spatial_split_param=None, seam_polish="off",
-                color_match=True, mask=None, skip_frozen_tiles=True) -> io.NodeOutput:
+                color_match=True, mask=None, skip_frozen_tiles=True, tiles="grid",
+                tile_size=768, context=128) -> io.NodeOutput:
         samples = latent["samples"]
         if not is_h3_av_latent(samples):
             raise ValueError("期望 MiniMax H3 AV latent (嵌套 video+audio)")
@@ -612,9 +689,34 @@ class MMH3SplitUpscale(io.ComfyNode):
             rows, cols, trows, tcols, row_ovl, col_ovl = [0], [0], [H], [W], [0], [0]
             seam_cap = 1.0
         nrows, ncols = len(rows), len(cols)
+        fade_h, fade_w = (spatial_split_param["fh"], spatial_split_param["fw"]) if spatial_split_param else (0, 0)
+
+        grid_plan = [(0, ri, cj, rows[ri], cols[cj], trows[ri], tcols[cj], row_ovl[ri], col_ovl[cj])
+                     for ri in range(nrows) for cj in range(ncols)]
+        plans = [grid_plan] * len(bounds)
+        if tiles == "around mask":
+            if umask is None:
+                raise ValueError("tiles = around mask needs a mask")
+            sq = px_to_lat(tile_size)
+            sp = spatial_split_param or {"th": sq, "tw": sq, "ol_h": snap_align(sq * 0.25),
+                                         "ol_w": snap_align(sq * 0.25), "fh": 0, "fw": 0, "mt": 16, "cap": 1.0}
+            ol_ratio_h, ol_ratio_w = sp["ol_h"] / max(sp["th"], 1), sp["ol_w"] / max(sp["tw"], 1)
+            fade_ratio_h = sp["fh"] / max(sp["ol_h"], 1) if sp["ol_h"] else 0.5
+            fade_ratio_w = sp["fw"] / max(sp["ol_w"], 1) if sp["ol_w"] else 0.5
+            lp = {"ol_h": min(sq - ALIGN, snap_align(sq * ol_ratio_h)), "ol_w": min(sq - ALIGN, snap_align(sq * ol_ratio_w)),
+                  "mt": min(sp["mt"], sq)}
+            fade_h, fade_w = int(round(lp["ol_h"] * fade_ratio_h)), int(round(lp["ol_w"] * fade_ratio_w))
+            seam_cap = sp.get("cap", 1.0)
+            ctx = int(round(context / VAE_DOWNSAMPLE))
+            plans = []
+            for i, (k0, f0, k1, f1) in enumerate(bounds):
+                plan, wins = mask_tile_plan(umask[0, 0, k0:k1], sq, sq, ctx, lp, H, W)
+                plans.append(plan)
+                where = ", ".join(f"{w * 16}x{h * 16} at {c * 16},{r * 16}" for r, c, h, w in wins) or "none (no white)"
+                print(f"[H3] [MASK] chunk {i}, frames {f0}-{f1 - 1}: {len(plan)} tile(s) around the mask: {where}")
 
         steps = max(int(sigmas.shape[-1]) - 1, 1)
-        n_tiles = len(bounds) * nrows * ncols
+        n_tiles = max(1, sum(len(p) for p in plans))
         for_tile = make_tile_progress(model.model_patcher if hasattr(model, "model_patcher") else model,
                                       steps, n_tiles)
 
@@ -649,95 +751,88 @@ class MMH3SplitUpscale(io.ComfyNode):
 
             # ================= 空间内循环 =================
             skipped = 0
-            for ri in range(nrows):
-                for cj in range(ncols):
-                    comfy.model_management.throw_exception_if_processing_interrupted()
-                    r0, c0 = rows[ri], cols[cj]
-                    tr, tc = trows[ri], tcols[cj]
-                    ovh, ovw = row_ovl[ri], col_ovl[cj]
+            for gi, ri, cj, r0, c0, tr, tc, ovh, ovw in plans[i]:
+                comfy.model_management.throw_exception_if_processing_interrupted()
 
-                    tile = chunk_out[:, :, :, r0:r0 + tr, c0:c0 + tc].clone()
+                tile = chunk_out[:, :, :, r0:r0 + tr, c0:c0 + tc].clone()
 
-                    if spatial_split_param is not None:
-                        fh, fw = spatial_split_param["fh"], spatial_split_param["fw"]
-                    else:
-                        fh = fw = 0
-                    m = spatial_fade_mask(tr, tc, ovh, ovw,
-                                          done_top=(ri > 0), done_left=(cj > 0),
-                                          fade_h=fh, fade_w=fw, seam_cap=seam_cap)
-                    mv = m[None, None, None].to(chunk_out.device)
-                    um_t = None
-                    if umask is not None:
-                        um_t = umask[:, :, k0:k1, r0:r0 + tr, c0:c0 + tc].to(chunk_out.device)
-                        if skip_frozen_tiles and float(um_t.max()) <= FROZEN_EPS:
-                            # all black: the sampler would hand back the input latent anyway
-                            skipped += 1
-                            tile_idx += 1
-                            continue
-                        mv = mv * um_t
-                    ma = torch.zeros((1, 32, 2, chunk_a.shape[-1]),
-                                     device=chunk_a.device, dtype=torch.float32)
-                    piece = {"samples": comfy.nested_tensor.NestedTensor((tile, chunk_a)),
-                             "noise_mask": comfy.nested_tensor.NestedTensor((mv, ma))}
-                    tile_noise = comfy.nested_tensor.NestedTensor((
-                        noise_vc[:, :, :, r0:r0 + tr, c0:c0 + tc].contiguous(),
-                        noise_ac.contiguous()))
+                fh, fw = fade_h, fade_w
+                m = spatial_fade_mask(tr, tc, ovh, ovw,
+                                      done_top=(ri > 0), done_left=(cj > 0),
+                                      fade_h=fh, fade_w=fw, seam_cap=seam_cap)
+                mv = m[None, None, None].to(chunk_out.device)
+                um_t = None
+                if umask is not None:
+                    um_t = umask[:, :, k0:k1, r0:r0 + tr, c0:c0 + tc].to(chunk_out.device)
+                    if skip_frozen_tiles and float(um_t.max()) <= FROZEN_EPS:
+                        # all black: the sampler would hand back the input latent anyway
+                        skipped += 1
+                        tile_idx += 1
+                        continue
+                    mv = mv * um_t
+                ma = torch.zeros((1, 32, 2, chunk_a.shape[-1]),
+                                 device=chunk_a.device, dtype=torch.float32)
+                piece = {"samples": comfy.nested_tensor.NestedTensor((tile, chunk_a)),
+                         "noise_mask": comfy.nested_tensor.NestedTensor((mv, ma))}
+                tile_noise = comfy.nested_tensor.NestedTensor((
+                    noise_vc[:, :, :, r0:r0 + tr, c0:c0 + tc].contiguous(),
+                    noise_ac.contiguous()))
 
-                    cond_tile = crop_keyframes_to_tile(cond_i, H, W, r0, c0, tr, tc)
-                    guider = build_guider(model, cond_tile, negative, cfg)
-                    out = sample_piece(piece, guider, tile_noise, noise.seed, sampler, sigmas,
-                                       for_tile(tile_idx))
-                    tile_v = (out.tensors[0] if out.is_nested else out).to(chunk_out.device)
+                cond_tile = crop_keyframes_to_tile(cond_i, H, W, r0, c0, tr, tc)
+                guider = build_guider(model, cond_tile, negative, cfg)
+                out = sample_piece(piece, guider, tile_noise, noise.seed, sampler, sigmas,
+                                   for_tile(tile_idx))
+                tile_v = (out.tensors[0] if out.is_nested else out).to(chunk_out.device)
 
-                    region = chunk_out[:, :, :, r0:r0 + tr, c0:c0 + tc].clone()
+                region = chunk_out[:, :, :, r0:r0 + tr, c0:c0 + tc].clone()
 
-                    if color_match:
-                        tile_v, _ = dc_correct(tile_v, [
-                            (tile_v[:, :, :, :, :ovw], region[:, :, :, :, :ovw])
-                                if (cj > 0 and ovw > 0) else None,
-                            (tile_v[:, :, :, :ovh, :], region[:, :, :, :ovh, :])
-                                if (ri > 0 and ovh > 0) else None,
-                            (tile_v, chunk_v[:, :, :, r0:r0 + tr, c0:c0 + tc])
-                                if (ri == 0 and cj == 0) else None,
-                        ])
+                if color_match:
+                    tile_v, _ = dc_correct(tile_v, [
+                        (tile_v[:, :, :, :, :ovw], region[:, :, :, :, :ovw])
+                            if (cj > 0 and ovw > 0) else None,
+                        (tile_v[:, :, :, :ovh, :], region[:, :, :, :ovh, :])
+                            if (ri > 0 and ovh > 0) else None,
+                        (tile_v, chunk_v[:, :, :, r0:r0 + tr, c0:c0 + tc])
+                            if (ri == 0 and cj == 0) else None,
+                    ])
 
-                    if um_t is not None:
-                        # [MASK] hard-restore frozen area to the input latent
-                        src_t = chunk_v[:, :, :, r0:r0 + tr, c0:c0 + tc].to(tile_v.device, tile_v.dtype)
-                        w_t = um_t.to(tile_v.device, tile_v.dtype)
-                        tile_v = src_t + (tile_v - src_t) * w_t
+                if um_t is not None:
+                    # [MASK] hard-restore frozen area to the input latent
+                    src_t = chunk_v[:, :, :, r0:r0 + tr, c0:c0 + tc].to(tile_v.device, tile_v.dtype)
+                    w_t = um_t.to(tile_v.device, tile_v.dtype)
+                    tile_v = src_t + (tile_v - src_t) * w_t
 
-                    if seam_polish != "off":
-                        if cj > 0 and ovw > 0 and \
-                                _should_polish(seam_polish, tile_v[:, :, :, :, :ovw], region[:, :, :, :, :ovw]):
-                            polish_queue[(i, ri, cj, "W")] = (c0, ovw, (k0, k1))
-                        if ri > 0 and ovh > 0 and \
-                                _should_polish(seam_polish, tile_v[:, :, :, :ovh, :], region[:, :, :, :ovh, :]):
-                            polish_queue[(i, ri, cj, "H")] = (r0, ovh, (k0, k1))
+                if seam_polish != "off":
+                    if cj > 0 and ovw > 0 and \
+                            _should_polish(seam_polish, tile_v[:, :, :, :, :ovw], region[:, :, :, :, :ovw]):
+                        polish_queue[(i, gi, ri, cj, "W")] = (c0, ovw, (k0, k1))
+                    if ri > 0 and ovh > 0 and \
+                            _should_polish(seam_polish, tile_v[:, :, :, :ovh, :], region[:, :, :, :ovh, :]):
+                        polish_queue[(i, gi, ri, cj, "H")] = (r0, ovh, (k0, k1))
 
-                    if cj > 0 and ovw > 0:
-                        wts = torch.linspace(0.0, 1.0, ovw, device=region.device,
-                                             dtype=region.dtype).view(1, 1, 1, 1, ovw)
-                        region[:, :, :, :, :ovw] = (region[:, :, :, :, :ovw] * (1.0 - wts)
-                                                    + tile_v[:, :, :, :, :ovw] * wts)
-                    if ri > 0 and ovh > 0:
-                        wts = torch.linspace(0.0, 1.0, ovh, device=region.device,
-                                             dtype=region.dtype).view(1, 1, 1, ovh, 1)
-                        region[:, :, :, :ovh, :] = (region[:, :, :, :ovh, :] * (1.0 - wts)
-                                                    + tile_v[:, :, :, :ovh, :] * wts)
-                    band = torch.zeros((1, 1, 1, tr, tc), dtype=torch.bool, device=region.device)
-                    if cj > 0 and ovw > 0:
-                        band[:, :, :, :, :ovw] = True
-                    if ri > 0 and ovh > 0:
-                        band[:, :, :, :ovh, :] = True
-                    region = torch.where(band, region, tile_v)
-                    chunk_out[:, :, :, r0:r0 + tr, c0:c0 + tc] = region
+                if cj > 0 and ovw > 0:
+                    wts = torch.linspace(0.0, 1.0, ovw, device=region.device,
+                                         dtype=region.dtype).view(1, 1, 1, 1, ovw)
+                    region[:, :, :, :, :ovw] = (region[:, :, :, :, :ovw] * (1.0 - wts)
+                                                + tile_v[:, :, :, :, :ovw] * wts)
+                if ri > 0 and ovh > 0:
+                    wts = torch.linspace(0.0, 1.0, ovh, device=region.device,
+                                         dtype=region.dtype).view(1, 1, 1, ovh, 1)
+                    region[:, :, :, :ovh, :] = (region[:, :, :, :ovh, :] * (1.0 - wts)
+                                                + tile_v[:, :, :, :ovh, :] * wts)
+                band = torch.zeros((1, 1, 1, tr, tc), dtype=torch.bool, device=region.device)
+                if cj > 0 and ovw > 0:
+                    band[:, :, :, :, :ovw] = True
+                if ri > 0 and ovh > 0:
+                    band[:, :, :, :ovh, :] = True
+                region = torch.where(band, region, tile_v)
+                chunk_out[:, :, :, r0:r0 + tr, c0:c0 + tc] = region
 
-                    tile_idx += 1
-                    comfy.model_management.soft_empty_cache()
+                tile_idx += 1
+                comfy.model_management.soft_empty_cache()
 
             if umask is not None and skip_frozen_tiles:
-                print(f"[H3] [MASK] chunk {i}: sampled {nrows * ncols - skipped} of {nrows * ncols} tiles")
+                print(f"[H3] [MASK] chunk {i}: sampled {len(plans[i]) - skipped} of {len(plans[i])} tiles")
             if color_match:
                 chunk_out, dcg = grade_pin(chunk_out, chunk_v)
                 if dcg is not None and dcg.abs().max().item() > 1e-4:
@@ -750,7 +845,7 @@ class MMH3SplitUpscale(io.ComfyNode):
                 pbar2 = comfy.utils.ProgressBar(steps * len(chunk_polish))
                 for pi, (key, (s0, band_w, (tk0, tk1))) in enumerate(chunk_polish):
                     comfy.model_management.throw_exception_if_processing_interrupted()
-                    axis = key[3]
+                    axis = key[-1]
                     t_len = tk1 - tk0
                     if axis == "W":
                         w0 = max(0, s0 - POLISH_HALO)
