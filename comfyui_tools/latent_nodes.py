@@ -808,6 +808,109 @@ class H3DecodeFrames:
         return (torch.stack([images[f] for f in wanted]), ", ".join(map(str, wanted)))
 
 
+def tensor_stats(t):
+    """One line of statistics, flagging NaN / Inf and an all-zero (empty) latent."""
+    f = t.detach().float()
+    finite = torch.isfinite(f)
+    bad = int((~finite).sum())
+    v = f[finite] if bad else f
+    if v.numel() == 0:
+        return "all NaN/Inf"
+    line = (f"mean {float(v.mean()):+.3f}, std {float(v.std()) if v.numel() > 1 else 0.0:.3f}, "
+            f"min {float(v.min()):+.3f}, max {float(v.max()):+.3f}")
+    if bad:
+        line += f", NaN/Inf {bad}"
+    if float(v.abs().max()) == 0.0:
+        line += " -- all zeros (empty latent)"
+    return line
+
+
+def describe_latent(latent):
+    """(text, frames, width, height) for any LATENT, with MiniMax H3 specifics."""
+    samples = latent["samples"]
+    parts = list(samples.tensors) if is_nested(samples) else [samples]
+    video = parts[0]
+    lines, frames, width, height = [], 1, 0, 0
+    h3 = is_nested(samples) and len(parts) >= 2 and video.ndim == 5 and video.shape[1] == 24 \
+        and parts[1].ndim == 4 and parts[1].shape[1] == 32
+
+    if h3 or (video.ndim == 5 and video.shape[1] == 24):
+        tokens = video.shape[2]
+        frames = frames_for_tokens(tokens)
+        height, width = video.shape[3] * 16, video.shape[4] * 16
+        kind = "MiniMax H3 video + audio" if h3 else "MiniMax H3 video (no audio part)"
+        grid = "on the 17k+5 grid" if (frames - 5) % H3_CLIP == 0 or tokens == 1 else "NOT on the 17k+5 grid"
+        lines.append(f"type: {kind}, batch {video.shape[0]}")
+        lines.append(f"video: {width}x{height} px ({video.shape[4]}x{video.shape[3]} latent cells, "
+                     f"aspect {width / height:.3f}), {'still' if tokens == 1 else f'{frames} frames'} "
+                     f"= {tokens} tokens, {frames / 24:.2f} s at 24 fps, {grid}")
+        if width % 32 or height % 32:
+            lines.append("  ! sides are not multiples of 32 px: H3 patches 2x2 cells and cannot sample this")
+    elif video.ndim == 5:
+        frames = video.shape[2]
+        lines.append(f"type: video latent [B, C, T, H, W], {video.shape[1]} channels, batch {video.shape[0]}")
+        lines.append(f"video: {video.shape[4]}x{video.shape[3]} latent cells, {frames} latent frames "
+                     "(pixel size depends on the model's VAE)")
+    elif video.ndim == 4:
+        lines.append(f"type: image latent [B, C, H, W], {video.shape[1]} channels, batch {video.shape[0]}")
+        lines.append(f"image: {video.shape[3]}x{video.shape[2]} latent cells (x8 for SD/SDXL/Flux, "
+                     "x16 for Flux 2 / H3; depends on the VAE)")
+        frames = video.shape[0]
+    else:
+        lines.append(f"type: tensor {tuple(video.shape)}")
+
+    names = ["video", "audio"] + [f"part {i}" for i in range(2, len(parts))] if len(parts) > 1 else ["samples"]
+    for name, t in zip(names, parts):
+        lines.append(f"{name}: {list(t.shape)} {str(t.dtype).replace('torch.', '')} on {t.device}; {tensor_stats(t)}")
+    if h3:
+        steps = parts[1].shape[-1]
+        expected = round(frames * 5 / 3) if video.shape[2] > 1 else steps
+        lines.append(f"audio: {steps} latent steps = {steps / 40:.2f} s (40 per second, 5/3 per frame)"
+                     + ("" if abs(steps - expected) <= 1 else f"; ! video wants {expected}"))
+
+    mask = latent.get("noise_mask")
+    if mask is not None:
+        mparts = list(mask.tensors) if is_nested(mask) else [mask]
+        for name, m in zip(names, mparts):
+            share = float((m.float() > 0.5).float().mean())
+            lines.append(f"noise_mask {name}: {list(m.shape)}, redraw {share:.1%} "
+                         f"(mean {float(m.float().mean()):.3f})")
+    else:
+        lines.append("noise_mask: none (the sampler redraws everything)")
+    others = {k: v for k, v in latent.items() if k not in ("samples", "noise_mask")}
+    for key, value in others.items():
+        shown = list(value.shape) if isinstance(value, torch.Tensor) else value
+        lines.append(f"{key}: {str(shown)[:200]}")
+    return "\n".join(lines), int(frames), int(width), int(height)
+
+
+class LatentInfo:
+    """Everything that can be read from a LATENT, MiniMax H3 in particular.
+
+    Size in pixels and latent cells, frames, tokens and seconds, whether the
+    length is on H3's 17k+5 grid, the audio part and how long it is, dtype
+    and device, value statistics (NaN / Inf and all-zero latents flagged),
+    noise_mask coverage and any other keys. Shown on the node; the latent
+    passes through, so the node can sit anywhere in a chain.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"latent": ("LATENT",)}}
+
+    RETURN_TYPES = ("LATENT", "STRING", "INT", "INT", "INT")
+    RETURN_NAMES = ("latent", "info", "frames", "width", "height")
+    FUNCTION = "inspect"
+    OUTPUT_NODE = True
+    CATEGORY = f"{CATEGORY}/latent"
+    DESCRIPTION = "Show everything about a latent: size, frames, seconds, audio, dtype, statistics, noise mask."
+
+    def inspect(self, latent):
+        text, frames, width, height = describe_latent(latent)
+        logging.info("[Latent Info]\n%s", text)
+        return {"ui": {"text": [text]}, "result": (latent, text, frames, width, height)}
+
+
 NODE_CLASS_MAPPINGS = {
     "ToolsSaveLatentTo": SaveLatentTo,
     "ToolsLoadLatentFrom": LoadLatentFrom,
@@ -817,6 +920,7 @@ NODE_CLASS_MAPPINGS = {
     "ToolsH3LatentPaste": H3LatentPaste,
     "ToolsH3LatentDiffMask": H3LatentDiffMask,
     "ToolsH3DecodeFrames": H3DecodeFrames,
+    "ToolsLatentInfo": LatentInfo,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -828,4 +932,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ToolsH3LatentPaste": "H3 Latent Paste (tools)",
     "ToolsH3LatentDiffMask": "H3 Latent Diff Mask (tools)",
     "ToolsH3DecodeFrames": "H3 Decode Frames (tools)",
+    "ToolsLatentInfo": "Latent Info (tools)",
 }

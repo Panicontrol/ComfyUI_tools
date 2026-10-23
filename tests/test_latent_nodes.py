@@ -209,3 +209,18 @@ def test_h3_decode_frames_picks_frames_from_partial_decodes():
     assert frames == "3, 100, 123"
     assert [int(images[i, 0, 0, 0]) for i in range(3)] == [owner[3], owner[100], owner[123]]
     assert sum(vae.calls) < tokens  # never the whole latent
+
+
+def test_latent_info_reads_h3_and_flags_problems():
+    from comfyui_tools.latent_nodes import LatentInfo
+
+    latent = h3_latent(tokens=37, rows=68, cols=120)  # 124 frames, 1920x1088
+    out = LatentInfo().inspect(latent)
+    text, frames, width, height = out["result"][1:]
+    assert (frames, width, height) == (124, 1920, 1088) and out["ui"]["text"] == [text]
+    assert "124 frames = 37 tokens, 5.17 s at 24 fps, on the 17k+5 grid" in text
+    assert "207 latent steps = 5.17 s" in text and "all zeros (empty latent)" in text
+
+    odd = {"samples": FakeNested([torch.full((1, 24, 3, 5, 6), float("nan")), torch.zeros(1, 32, 2, 10)])}
+    text = LatentInfo().inspect(odd)["result"][1]
+    assert "NOT on the 17k+5 grid" in text and "not multiples of 32 px" in text and "all NaN/Inf" in text
