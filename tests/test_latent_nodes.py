@@ -247,3 +247,20 @@ def test_h3_crop_extended_mask_options():
     # without time_from_mask the box only looks at the frames being cropped: frames 0-21 have just the speck
     with pytest.raises(ValueError, match="empty in frames 0-21"):
         H3LatentCrop().crop(latent, 0, 0, 0, 0, 0, 22, mask=mask, despeckle=8)
+
+
+def test_h3_latent_resize_downscales_video_only():
+    from comfyui_tools.latent_nodes import H3LatentResize
+
+    latent = h3_latent(tokens=37, rows=96, cols=168)          # 2688x1536
+    latent["samples"].tensors[0].fill_(2.0)
+    latent["noise_mask"] = FakeNested([torch.ones(1, 1, 37, 96, 168), torch.zeros(1, 32, 2, 207)])
+    out, w, h = H3LatentResize().resize(latent, scale=0.5)
+    video, audio = out["samples"].tensors
+    assert (w, h) == (1344, 768) and video.shape == (1, 24, 37, 48, 84)
+    assert torch.allclose(video, torch.full_like(video, 2.0))  # area keeps flat values
+    assert torch.equal(audio, latent["samples"].tensors[1])
+    assert out["noise_mask"].tensors[0].shape == (1, 1, 37, 48, 84)
+
+    _, w, h = H3LatentResize().resize(latent, width=1000)      # height from the aspect, both on the 32 px grid
+    assert (w, h) == (992, 576)

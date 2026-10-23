@@ -1102,6 +1102,98 @@ class LatentInfo:
         return {"ui": {"text": [text]}, "result": (latent, text, frames, width, height)}
 
 
+class H3LatentResize:
+    """Resize a MiniMax H3 latent in space -- down as well as up -- keeping it valid for H3.
+
+    Only the video part is resized, frame by frame; the audio part and the
+    frame count stay as they are, and a noise_mask is resized with the video.
+    The size snaps to the 32 px grid H3 patches on. area averages latent
+    cells and suits downscaling; for upscaling the MiniMax H3 Latent Upscaler
+    model does much better. Resizing in latent space is an approximation: for
+    the cleanest result decode, resize the frames and encode again, or follow
+    with a low-denoise pass.
+    """
+
+    METHODS = ["area", "bilinear", "bicubic", "nearest-exact"]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent": ("LATENT",),
+                "scale": ("FLOAT", {"default": 0.5, "min": 0.05, "max": 8.0, "step": 0.01,
+                                    "tooltip": "Used when width and height are 0."}),
+                "width": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 32,
+                                  "tooltip": "Target width in px; 0 = from scale, or from height keeping the "
+                                             "aspect ratio."}),
+                "height": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 32,
+                                   "tooltip": "Target height in px; 0 = from scale, or from width keeping the "
+                                              "aspect ratio."}),
+                "method": (cls.METHODS, {"default": "area",
+                                         "tooltip": "area averages cells (best for downscaling)."}),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "INT", "INT")
+    RETURN_NAMES = ("latent", "width", "height")
+    FUNCTION = "resize"
+    CATEGORY = f"{CATEGORY}/latent"
+    DESCRIPTION = "Resize a MiniMax H3 latent's video part (down or up) to the 32 px grid; audio stays as it is."
+
+    @staticmethod
+    def _resize_video(t, rows, cols, method):
+        import torch.nn.functional as F
+
+        if t.ndim == 4:
+            frames = t
+        else:
+            b, c, n = t.shape[:3]
+            frames = t.movedim(2, 1).reshape(b * n, c, t.shape[3], t.shape[4])
+        kwargs = {"align_corners": False} if method in ("bilinear", "bicubic") else {}
+        out = F.interpolate(frames.float(), size=(rows, cols), mode=method, **kwargs).to(t.dtype)
+        if t.ndim == 4:
+            return out
+        return out.reshape(b, n, c, rows, cols).movedim(1, 2)
+
+    def resize(self, latent, scale=0.5, width=0, height=0, method="area"):
+        samples = latent["samples"]
+        nested = is_nested(samples)
+        video = samples.tensors[0] if nested else samples
+        if video.ndim not in (4, 5):
+            raise ValueError(f"expected a latent [B, C, (T,) H, W], got {tuple(video.shape)}")
+        h_in, w_in = video.shape[-2] * 16, video.shape[-1] * 16
+        if width > 0 and height > 0:
+            w, h = width, height
+        elif width > 0:
+            w, h = width, width * h_in / w_in
+        elif height > 0:
+            w, h = height * w_in / h_in, height
+        else:
+            w, h = w_in * scale, h_in * scale
+        w, h = max(32, int(round(w / 32)) * 32), max(32, int(round(h / 32)) * 32)  # H3 patches 2x2 cells
+        rows, cols = h // 16, w // 16
+
+        out = dict(latent)
+        if (rows, cols) != tuple(video.shape[-2:]):
+            new_video = self._resize_video(video, rows, cols, method)
+            out["samples"] = type(samples)([new_video, *samples.tensors[1:]]) if nested else new_video
+            mask = latent.get("noise_mask")
+            if mask is not None:
+                parts = list(mask.tensors) if is_nested(mask) else [mask]
+                m = parts[0]
+                if m.ndim >= 4 and tuple(m.shape[-2:]) == tuple(video.shape[-2:]):
+                    lead = m.shape[:-2]
+                    m = self._resize_video(m.reshape(-1, 1, *m.shape[-2:]).float(), rows, cols,
+                                           "bilinear" if method == "nearest-exact" else method)
+                    parts[0] = m.reshape(*lead, rows, cols).clamp(0, 1)
+                    out["noise_mask"] = type(mask)(parts) if is_nested(mask) else parts[0]
+                else:
+                    out.pop("noise_mask")
+                    logging.warning("[H3 Latent Resize] noise_mask of an unexpected shape was dropped")
+        logging.info("[H3 Latent Resize] %dx%d -> %dx%d px (%s)", w_in, h_in, w, h, method)
+        return (out, w, h)
+
+
 NODE_CLASS_MAPPINGS = {
     "ToolsSaveLatentTo": SaveLatentTo,
     "ToolsLoadLatentFrom": LoadLatentFrom,
@@ -1112,6 +1204,7 @@ NODE_CLASS_MAPPINGS = {
     "ToolsH3LatentDiffMask": H3LatentDiffMask,
     "ToolsH3DecodeFrames": H3DecodeFrames,
     "ToolsLatentInfo": LatentInfo,
+    "ToolsH3LatentResize": H3LatentResize,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1124,4 +1217,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ToolsH3LatentDiffMask": "H3 Latent Diff Mask (tools)",
     "ToolsH3DecodeFrames": "H3 Decode Frames (tools)",
     "ToolsLatentInfo": "Latent Info (tools)",
+    "ToolsH3LatentResize": "H3 Latent Resize (tools)",
 }
