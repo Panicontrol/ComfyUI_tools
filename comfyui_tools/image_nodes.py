@@ -574,6 +574,7 @@ class SaveImageSequence:
 
     In <save_folder>, for new_folder = depth and version 4:
       depth_v004.mp4                        always
+      depth_v004.latent                     latent connected: for Load Latent From
       depth_v004.zip                        need_zip: the frames, zipped
       depth_v004/depth_v004.01001.png ...   need_save: the frames
 
@@ -627,12 +628,16 @@ class SaveImageSequence:
                     "default": False,
                     "tooltip": "Also save the workflow next to the video as <name>_v###.json.",
                 }),
+                "latent": ("LATENT", {
+                    "tooltip": "Also save this latent next to the video as <name>_v###.latent "
+                               "(MiniMax H3 video+audio included); load it with Load Latent From.",
+                }),
             },
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
 
-    RETURN_TYPES = ("STRING", "INT", "INT", "STRING")
-    RETURN_NAMES = ("folder", "version", "count", "video")
+    RETURN_TYPES = ("STRING", "INT", "INT", "STRING", "STRING")
+    RETURN_NAMES = ("folder", "version", "count", "video", "latent_path")
     FUNCTION = "save"
     OUTPUT_NODE = True
     CATEGORY = f"{CATEGORY}/image"
@@ -641,7 +646,7 @@ class SaveImageSequence:
 
     def save(self, images, save_folder, new_folder, number_version, start_frame_index,
              padding_frame_name, overwrite, masks=None, frame_rate=24.0, need_save=True,
-             need_zip=False, embed_workflow=True, save_workflow_json=False, prompt=None,
+             need_zip=False, embed_workflow=True, save_workflow_json=False, latent=None, prompt=None,
              extra_pnginfo=None):
         import io
         import zipfile
@@ -658,6 +663,7 @@ class SaveImageSequence:
         video_path = os.path.join(project, f"{versioned}.mp4")
         zip_path = os.path.join(project, f"{versioned}.zip")
         json_path = os.path.join(project, f"{versioned}.json")
+        latent_path = os.path.join(project, f"{versioned}.latent") if latent is not None else ""
 
         frames = int(images.shape[0])
         names = [
@@ -670,6 +676,8 @@ class SaveImageSequence:
             targets.append(zip_path)
         if save_workflow_json:
             targets.append(json_path)
+        if latent_path:
+            targets.append(latent_path)
         if need_save:
             targets += [os.path.join(folder, n) for n in names]
         if not overwrite:
@@ -725,7 +733,12 @@ class SaveImageSequence:
             with open(json_path, "w", encoding="utf-8") as handle:
                 json.dump(workflow, handle, indent=2, ensure_ascii=False)
 
-        return {"ui": {"text": [video_path]}, "result": (folder, number_version, frames, video_path)}
+        if latent_path:
+            from .latent_nodes import write_latent
+
+            write_latent(latent_path, latent)
+
+        return {"ui": {"text": [video_path]}, "result": (folder, number_version, frames, video_path, latent_path)}
 
 NODE_CLASS_MAPPINGS = {
     "ToolsImageResize": ImageResize,

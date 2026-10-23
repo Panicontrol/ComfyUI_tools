@@ -16,7 +16,8 @@ def save(images, folder, **kwargs):
 
 def test_video_sequence_and_zip_layout(tmp_path):
     images, masks = torch.rand(3, 6, 9, 3), torch.rand(3, 6, 9)  # odd width on purpose
-    folder, version, count, video = save(images, tmp_path, masks=masks, need_zip=True)
+    folder, version, count, video, latent_path = save(images, tmp_path, masks=masks, need_zip=True)
+    assert latent_path == ""  # nothing connected, nothing written
     assert video == str(tmp_path / "depth_v004.mp4")
     assert folder == str(tmp_path / "depth_v004") and (version, count) == (4, 3)
 
@@ -49,7 +50,7 @@ def test_workflow_is_embedded_in_the_video(tmp_path):
 
     workflow = {"nodes": [{"id": 1, "type": "ToolsSaveImageSequence"}], "links": []}
     prompt = {"1": {"class_type": "ToolsSaveImageSequence", "inputs": {}}}
-    *_, video = save(torch.rand(1, 4, 4, 3), tmp_path, need_save=False,
+    *_, video, _ = save(torch.rand(1, 4, 4, 3), tmp_path, need_save=False,
                      prompt=prompt, extra_pnginfo={"workflow": workflow})
     with av.open(video) as container:
         assert json.loads(container.metadata["workflow"]) == workflow
@@ -60,8 +61,21 @@ def test_workflow_embedding_can_be_off_and_json_saved_instead(tmp_path):
     import json
 
     workflow = {"nodes": [{"id": 1}], "links": []}
-    *_, video = save(torch.rand(1, 4, 4, 3), tmp_path, need_save=False, embed_workflow=False,
+    *_, video, _ = save(torch.rand(1, 4, 4, 3), tmp_path, need_save=False, embed_workflow=False,
                      save_workflow_json=True, prompt={"1": {}}, extra_pnginfo={"workflow": workflow})
     with av.open(video) as container:
         assert "workflow" not in container.metadata
     assert json.loads((tmp_path / "depth_v004.json").read_text()) == workflow
+
+
+def test_latent_saved_next_to_the_video(tmp_path):
+    from comfyui_tools.latent_nodes import LoadLatentFrom
+
+    latent = {"samples": torch.randn(1, 24, 2, 4, 4)}
+    *_, latent_path = save(torch.rand(1, 4, 4, 3), tmp_path, need_save=False, latent=latent)
+    assert latent_path == str(tmp_path / "depth_v004.latent")
+    assert torch.equal(LoadLatentFrom().load(latent_path)[0]["samples"], latent["samples"])
+
+    (tmp_path / "depth_v004.mp4").unlink()  # only the latent is left: still refuses to overwrite it
+    with pytest.raises(ValueError, match="depth_v004.latent"):
+        save(torch.rand(1, 4, 4, 3), tmp_path, need_save=False, latent=latent)

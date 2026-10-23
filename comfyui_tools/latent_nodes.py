@@ -101,6 +101,16 @@ def unpack(tensors, metadata):
     return latent
 
 
+def write_latent(path, latent):
+    """Write a LATENT dict as a .latent file that Load Latent From reads back."""
+    tensors, metadata = pack(latent)
+    # safetensors' save_file creates the file 0600 whatever the umask, so
+    # other users and tools on Linux cannot read it; writing the bytes
+    # with open() gives the usual permissions, like every other output
+    with open(path, "wb") as handle:
+        handle.write(safetensors.torch.save(tensors, metadata=metadata))
+
+
 def next_free_path(directory, prefix):
     counter = 1
     while True:
@@ -137,13 +147,7 @@ class SaveLatentTo:
         folder = os.path.expanduser(str(directory).strip().strip('"')) or default_directory()
         os.makedirs(folder, exist_ok=True)
         path = next_free_path(folder, filename_prefix.strip() or "latent")
-
-        tensors, metadata = pack(samples)
-        # safetensors' save_file creates the file 0600 whatever the umask, so
-        # other users and tools on Linux cannot read it; writing the bytes
-        # with open() gives the usual permissions, like every other output
-        with open(path, "wb") as handle:
-            handle.write(safetensors.torch.save(tensors, metadata=metadata))
+        write_latent(path, samples)
         return {"ui": {"text": [path]}, "result": (samples, path)}
 
 
