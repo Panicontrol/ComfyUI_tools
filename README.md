@@ -91,6 +91,15 @@ H3 audio VAE runs at, so LanPaint never has to resample (that path needs
 | --- | --- |
 | **Tools Video Reel: concat + stamp** | Concatenate mp4 clips into one reel at `output_path` (H.264, `crf`), with each clip's own text stamp in the top-left corner on a translucent box. `items` holds one block per clip, separated by a blank line: the clip's absolute path, then its stamp lines. Clips of another size are fitted into `width` × `height` on black; `frame_step` 2 with `frame_rate` 12 keeps every second frame. Frames are streamed, so long reels never sit in memory; an existing reel is kept unless `overwrite` is on. |
 
+### tools/shot
+
+Folders of a staged pipeline: `<root>/<shot>/_tmp/<stage>/<name>_vNNN.*` per stage (`01_generate`, `02_track`, `03_detail`, `04_upscale`), picked results in `<root>/<shot>/final/<shot>_final_vNNN/`.
+
+| Node | What it does |
+| --- | --- |
+| **Shot Paths** | Every path one stage of one shot needs, set in one place: `save_folder` and `new_folder` (`<shot>` or `<shot>_<object>`) for Save Image Sequence, and the `source_video` / `source_latent` / `source_frames` of `source_stage` -- `source_version` 0 picks the latest one on disk (the node reruns when that folder changes) and returns the version it chose. A missing source gives an error listing the versions that exist. Creates no folders. |
+| **Shot Finalize** | Copies picked results (`items`, one per line: `04_upscale v003 -> final`, `02_track v004 fly -> mask_fly`) into a new `<shot>_final_vNNN`, renamed: video, PNG folder (`copy_frames`), `.latent` (`copy_latents`), workflow `.json`, plus a `manifest.md` with sizes and the models, seeds, steps, denoise and prompt texts read from each mp4's embedded prompt. Everything is checked before anything is copied; existing final folders are never touched; `dry_run` (on by default) only shows the plan. `delete_tmp` removes `<shot>/_tmp` only after every copy worked and only when `confirm_delete` holds the shot name -- to the recycle bin when `send2trash` is installed. The report shows on the node. |
+
 ### tools/latent
 
 | Node | What it does |

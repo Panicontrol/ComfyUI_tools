@@ -35,4 +35,5 @@ def test_all_node_packs_are_discovered():
         "tools/av",
         "tools/latent",
         "tools/video",
+        "tools/shot",
     }
