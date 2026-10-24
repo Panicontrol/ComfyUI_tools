@@ -55,7 +55,9 @@ import comfy.samplers
 import comfy.utils
 import comfy.nested_tensor
 import latent_preview
-from comfy_api.latest import io
+from comfy_api.latest import io, ui
+
+from .tile_prompts import cell_at, draw_tile_map, fill_template, parse_tile_prompts, tile_name, with_tile_text
 
 try:
     from comfy.ldm.minimax.model import FRAME_PER_TOKEN, FRAME_RESCALE
@@ -65,6 +67,7 @@ except Exception:
 
 H3_TEMPORAL_PARAM = io.Custom("H3_TEMPORAL_PARAM_V10")
 H3_SPATIAL_PARAM = io.Custom("H3_SPATIAL_PARAM_V10")
+H3_TILE_PROMPTS = io.Custom("H3_TILE_PROMPTS")
 
 VAE_DOWNSAMPLE = 16
 ALIGN = 2
@@ -315,6 +318,12 @@ def compute_spatial_grid(h, w, th, tw, ol_h, ol_w, min_th=0, min_tw=0):
     rows, trows, row_ovl = _grid_1d(h, th, ol_h, min_th)
     cols, tcols, col_ovl = _grid_1d(w, tw, ol_w, min_tw)
     return rows, cols, trows, tcols, row_ovl, col_ovl
+
+def spatial_grid(h, w, sp):
+    """The upscale's tile grid of an h x w latent: (rows, cols, trows, tcols, row_ovl, col_ovl), in cells."""
+    if sp is None:
+        return [0], [0], [h], [w], [0], [0]
+    return compute_spatial_grid(h, w, sp["th"], sp["tw"], sp["ol_h"], sp["ol_w"], sp["mt"], sp["mt"])
 
 def _square_window(b0, b1, dim, size):
     """Start of a size-long window (even cells) around [b0, b1), kept inside [0, dim)."""
@@ -606,6 +615,79 @@ class H3SpatialSplitParams(io.ComfyNode):
         return io.NodeOutput(param, preview)
 
 
+class H3TilePrompts(io.ComfyNode):
+    """A prompt per tile of H3 Masked Split Upscale's grid, encoded once each.
+
+    The grid is the upscale's own (same latent, same spatial_split_param);
+    tiles are r<row>c<col> from the top left, shown on tile_map. A tile's
+    prompt is template with {tile} replaced; tiles without one, and seam
+    polish, use the upscale's conditioning. Only the text changes per tile:
+    keyframes and references stay those of the upscale's conditioning.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="ToolsH3TilePrompts", display_name="H3 Tile Prompts (tools)",
+            category="tools/latent",
+            description="A prompt per tile of H3 Masked Split Upscale; shows the grid with the tile names.",
+            inputs=[
+                io.Clip.Input("clip"),
+                io.Latent.Input("latent", tooltip="The latent going into the upscale: the grid follows its size."),
+                io.String.Input("prompts", multiline=True,
+                                default="# r<row>c<col>: prompt, tiles from the top left (see tile_map)\n"
+                                        "# r0c* = the top row, r*c0 = the left column, * = every tile\n",
+                                tooltip="One tile (or a comma list) per line, 'r0c1: <prompt>'; lines without a "
+                                        "tile continue the prompt above. The more specific key wins. Tiles not "
+                                        "named use the upscale's conditioning."),
+                io.String.Input("template", multiline=True, default="{tile}",
+                                tooltip="Every tile prompt is this with {tile} replaced by the tile's text: keep "
+                                        "the shared style, light and lens here, so neighbouring tiles match at "
+                                        "the seams."),
+                H3_SPATIAL_PARAM.Input("spatial_split_param", optional=True,
+                                       tooltip="The same one the upscale gets."),
+                io.Image.Input("image", optional=True,
+                               tooltip="A frame of the shot to draw the grid on, any size; else a grey canvas."),
+            ],
+            outputs=[
+                H3_TILE_PROMPTS.Output("tile_prompts"),
+                io.Image.Output("tile_map"),
+                io.String.Output("info"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, clip, latent, prompts, template="{tile}", spatial_split_param=None,
+                image=None) -> io.NodeOutput:
+        samples = latent["samples"]
+        if not is_h3_av_latent(samples):
+            raise ValueError("H3 Tile Prompts needs the MiniMax H3 AV latent that goes into the upscale")
+        H, W = samples.tensors[0].shape[3], samples.tensors[0].shape[4]
+        rows, cols, trows, tcols, _, _ = spatial_grid(H, W, spatial_split_param)
+        texts = parse_tile_prompts(prompts, len(rows), len(cols))
+        encoded, conds = {}, {}
+        for tile, text in texts.items():
+            full = fill_template(template, text)
+            if full not in encoded:  # tiles sharing a prompt share its encoding
+                encoded[full] = clip.encode_from_tokens_scheduled(clip.tokenize(full))
+            conds[tile] = encoded[full]
+
+        lines = [f"grid {len(rows)} rows x {len(cols)} columns over {W * 16}x{H * 16} px: "
+                 f"{len(conds)} tile(s) with their own prompt ({len(encoded)} encoded), "
+                 f"the rest use the upscale's conditioning"]
+        for ri in range(len(rows)):
+            for cj in range(len(cols)):
+                text = " ".join(texts.get((ri, cj), "").split())
+                lines.append(f"{tile_name(ri, cj)} (x {cols[cj] * 16}-{(cols[cj] + tcols[cj]) * 16}, "
+                             f"y {rows[ri] * 16}-{(rows[ri] + trows[ri]) * 16}): "
+                             + (text[:80] + ("…" if len(text) > 80 else "") if text else "main conditioning"))
+        info = "\n".join(lines)
+        print("[H3] [PROMPT] " + info.replace("\n", "\n[H3] [PROMPT]   "))
+        tile_map = draw_tile_map(image, H, W, rows, cols, trows, tcols, conds)
+        made = {"size": (H, W), "grid": (rows, cols, trows, tcols), "conds": conds}
+        return io.NodeOutput(made, tile_map, info, ui=ui.PreviewImage(tile_map, cls=cls))
+
+
 # ---------------------------------------------------------------------------
 # 主节点
 # ---------------------------------------------------------------------------
@@ -654,6 +736,11 @@ class MMH3SplitUpscale(io.ComfyNode):
                              tooltip="Gaussian radius of the soft edge, px of the latent's frame: the hand-over to "
                                      "the plate runs about 2x this wide, centred on the grown edge (32 -> ~64 px, "
                                      "4 latent cells). 0 if the mask is already feathered."),
+                H3_TILE_PROMPTS.Input("tile_prompts", optional=True,
+                                      tooltip="From H3 Tile Prompts (same latent and spatial_split_param): a "
+                                              "prompt per tile. Tiles without one, and seam polish, use "
+                                              "conditioning; around mask, a window takes the prompt of the "
+                                              "grid tile nearest its centre."),
             ],
             outputs=[io.Latent.Output("latent")],
         )
@@ -663,7 +750,8 @@ class MMH3SplitUpscale(io.ComfyNode):
                 negative=None, cfg=1.0, temporal_split_param=None,
                 spatial_split_param=None, seam_polish="off",
                 color_match=True, mask=None, skip_frozen_tiles=True, tiles="grid",
-                tile_size=768, context=128, mask_grow=32, mask_feather=32) -> io.NodeOutput:
+                tile_size=768, context=128, mask_grow=32, mask_feather=32,
+                tile_prompts=None) -> io.NodeOutput:
         samples = latent["samples"]
         if not is_h3_av_latent(samples):
             raise ValueError("期望 MiniMax H3 AV latent (嵌套 video+audio)")
@@ -697,15 +785,21 @@ class MMH3SplitUpscale(io.ComfyNode):
             bounds = [(0, 0, T, frames_for_tokens(T))]
             anchor_strength, motion_n, identity_n = 0.999, 0, 0
 
-        if spatial_split_param is not None:
-            sp = spatial_split_param
-            rows, cols, trows, tcols, row_ovl, col_ovl = compute_spatial_grid(
-                H, W, sp["th"], sp["tw"], sp["ol_h"], sp["ol_w"], sp["mt"], sp["mt"])
-            seam_cap = sp.get("cap", 1.0)
-        else:
-            rows, cols, trows, tcols, row_ovl, col_ovl = [0], [0], [H], [W], [0], [0]
-            seam_cap = 1.0
+        rows, cols, trows, tcols, row_ovl, col_ovl = spatial_grid(H, W, spatial_split_param)
+        seam_cap = spatial_split_param.get("cap", 1.0) if spatial_split_param is not None else 1.0
         nrows, ncols = len(rows), len(cols)
+
+        if tile_prompts is not None:
+            p_rows, p_cols, p_trows, p_tcols = tile_prompts["grid"]
+            if tile_prompts["size"] != (H, W) or (tiles == "grid" and
+                                                  (p_rows, p_cols, p_trows, p_tcols) != (rows, cols, trows, tcols)):
+                raise ValueError(
+                    f"tile_prompts were made for {len(p_rows)}x{len(p_cols)} tiles over "
+                    f"{tile_prompts['size'][1] * 16}x{tile_prompts['size'][0] * 16} px, this upscale has "
+                    f"{nrows}x{ncols} over {W * 16}x{H * 16} px: give H3 Tile Prompts the same latent and "
+                    f"spatial_split_param")
+            print(f"[H3] [PROMPT] {len(tile_prompts['conds'])} of {len(p_rows) * len(p_cols)} tiles have their "
+                  f"own prompt; the others and seam polish use conditioning")
         fade_h, fade_w = (spatial_split_param["fh"], spatial_split_param["fw"]) if spatial_split_param else (0, 0)
 
         grid_plan = [(0, ri, cj, rows[ri], cols[cj], trows[ri], tcols[cj], row_ovl[ri], col_ovl[cj])
@@ -795,7 +889,17 @@ class MMH3SplitUpscale(io.ComfyNode):
                     noise_vc[:, :, :, r0:r0 + tr, c0:c0 + tc].contiguous(),
                     noise_ac.contiguous()))
 
-                cond_tile = crop_keyframes_to_tile(cond_i, H, W, r0, c0, tr, tc)
+                cond_src = cond_i
+                if tile_prompts is not None:
+                    if tiles == "grid":
+                        cell = (ri, cj)
+                    else:  # a window around the mask: the grid tile nearest its centre
+                        cell = (cell_at(p_rows, p_trows, r0 + tr / 2), cell_at(p_cols, p_tcols, c0 + tc / 2))
+                    own = tile_prompts["conds"].get(cell)
+                    if own is not None:
+                        # only the text changes: keyframes, refs and anchors stay those of cond_i
+                        cond_src = with_tile_text(cond_i, own)
+                cond_tile = crop_keyframes_to_tile(cond_src, H, W, r0, c0, tr, tc)
                 guider = build_guider(model, cond_tile, negative, cfg)
                 out = sample_piece(piece, guider, tile_noise, noise.seed, sampler, sigmas,
                                    for_tile(tile_idx))
@@ -937,10 +1041,12 @@ class MMH3SplitUpscale(io.ComfyNode):
 NODE_CLASS_MAPPINGS = {
     "ToolsH3TemporalSplitParams": H3TemporalSplitParams,
     "ToolsH3SpatialSplitParams": H3SpatialSplitParams,
+    "ToolsH3TilePrompts": H3TilePrompts,
     "ToolsH3MaskedSplitUpscale": MMH3SplitUpscale,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ToolsH3TemporalSplitParams": "H3 Temporal Split Params (tools)",
     "ToolsH3SpatialSplitParams": "H3 Spatial Split Params (tools)",
+    "ToolsH3TilePrompts": "H3 Tile Prompts (tools)",
     "ToolsH3MaskedSplitUpscale": "H3 Masked Split Upscale (tools)",
 }
