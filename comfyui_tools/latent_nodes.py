@@ -1102,6 +1102,67 @@ class LatentInfo:
         return {"ui": {"text": [text]}, "result": (latent, text, frames, width, height)}
 
 
+class H3LatentCheck:
+    """Stop a graph early when a MiniMax H3 latent is not what it expects.
+
+    Size in px, video frames, the 17k+5 frame grid and the audio part are read
+    the way Latent Info reads them and compared with every condition set; any
+    mismatch is an error listing all of them, before decoding or sampling.
+    The latent passes through unchanged -- nothing is resized, cut or added.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent": ("LATENT",),
+                "width": ("INT", {"default": 1344, "min": 0, "max": 16384, "step": 16,
+                                  "tooltip": "Expected width in px; 0 = any."}),
+                "height": ("INT", {"default": 768, "min": 0, "max": 16384, "step": 16,
+                                   "tooltip": "Expected height in px; 0 = any."}),
+                "frames": ("INT", {"default": 0, "min": 0, "max": 100000,
+                                   "tooltip": "Expected video frames; 0 = any."}),
+                "frame_grid": ("BOOLEAN", {"default": True,
+                                           "tooltip": "Frames on H3's 17k+5 grid (73, 124, 158, 192 ...)."}),
+                "require_audio": ("BOOLEAN", {"default": True,
+                                              "tooltip": "The latent has an audio part (an AV latent, as "
+                                                         "Save Image Sequence writes it)."}),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "STRING")
+    RETURN_NAMES = ("latent", "info")
+    FUNCTION = "check"
+    CATEGORY = f"{CATEGORY}/latent"
+    DESCRIPTION = "Check a MiniMax H3 latent's size, frames and audio part; stop the graph with every mismatch."
+
+    def check(self, latent, width=1344, height=768, frames=0, frame_grid=True, require_audio=True):
+        samples = latent["samples"]
+        parts = list(samples.tensors) if is_nested(samples) else [samples]
+        video = parts[0]
+        if video.ndim != 5 or video.shape[1] != 24:
+            raise ValueError(f"latent check: not a MiniMax H3 latent (video part {list(video.shape)}, "
+                             "expected [1, 24, tokens, h, w])")
+        w, h, n = video.shape[4] * 16, video.shape[3] * 16, frames_for_tokens(video.shape[2])
+        audio = len(parts) >= 2 and parts[1].ndim == 4 and parts[1].shape[1] == 32
+
+        problems = []
+        if (width and w != width) or (height and h != height):
+            wanted = f"{width}x{height}" if width and height else f"width {width}" if width else f"height {height}"
+            problems.append(f"{w}x{h} (expected {wanted})")
+        if frames and n != frames:
+            problems.append(f"{n} frames (expected {frames})")
+        if frame_grid and (n - 5) % H3_CLIP:
+            problems.append(f"{n} frames not on 17k+5 grid")
+        if require_audio and not audio:
+            problems.append("no audio part")
+        if problems:
+            raise ValueError("latent check: " + "; ".join(problems))
+
+        info = f"{w}x{h}, {n} frames ({n / 24:.2f} s @24), audio {'yes' if audio else 'no'}"
+        return {"ui": {"text": [info]}, "result": (latent, info)}
+
+
 class H3LatentResize:
     """Resize a MiniMax H3 latent in space -- down as well as up -- keeping it valid for H3.
 
@@ -1204,6 +1265,7 @@ NODE_CLASS_MAPPINGS = {
     "ToolsH3LatentDiffMask": H3LatentDiffMask,
     "ToolsH3DecodeFrames": H3DecodeFrames,
     "ToolsLatentInfo": LatentInfo,
+    "ToolsH3LatentCheck": H3LatentCheck,
     "ToolsH3LatentResize": H3LatentResize,
 }
 
@@ -1217,5 +1279,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ToolsH3LatentDiffMask": "H3 Latent Diff Mask (tools)",
     "ToolsH3DecodeFrames": "H3 Decode Frames (tools)",
     "ToolsLatentInfo": "Latent Info (tools)",
+    "ToolsH3LatentCheck": "H3 Latent Check (tools)",
     "ToolsH3LatentResize": "H3 Latent Resize (tools)",
 }

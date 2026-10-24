@@ -6,7 +6,10 @@ Layout, shared by both nodes:
     <root>/<shot>/final/<shot>_final_vNNN/      picked results + manifest.md
 
 <name> is <shot> or <shot>_<object>, the way Save Image Sequence names its
-files (<new_folder>_vNNN). base is the shot's one versioned chain, always
+files (<new_folder>_vNNN). A version's main file is its .latent -- the mp4 is
+a preview that can always be decoded from it -- so a version exists when
+either is there; a base from elsewhere is just a .latent dropped into
+_tmp/base. base is the shot's one versioned chain, always
 <shot>_vNNN: generation writes v001 and every detail pass reads the latest
 version and writes the next. Shot Paths hands every stage its folders and
 finds its source; Shot Finalize copies picked results into a new final folder
@@ -64,6 +67,11 @@ def versions_of(folder, name, ext=".mp4"):
     return found
 
 
+def result_versions(folder, name):
+    """{version: path} of a stage's results: the .mp4, or the .latent where a version has no mp4."""
+    return {**versions_of(folder, name, ".latent"), **versions_of(folder, name)}
+
+
 def version_list(found, padding=3):
     return ", ".join(f"v{v:0{padding}d}" for v in sorted(found)) or "none"
 
@@ -74,8 +82,9 @@ class ShotPaths:
     save_folder / new_folder go to Save Image Sequence; source_* point at the
     output of source_stage (0 = its latest version). stage base with source
     base is a detail pass: it reads the latest base and Save writes the next
-    one. info is one line, '<stage> <- <source_stage> <file name>', for the
-    notes of Save Image Sequence. Creates no folders.
+    one. A source version exists when its .latent or its .mp4 does. info is
+    one line, '<stage> <- <source_stage> <file name>' plus '(no mp4)' /
+    '(no latent)', for the notes of Save Image Sequence. Creates no folders.
     """
 
     @classmethod
@@ -135,19 +144,23 @@ class ShotPaths:
             folder = stage_folder(root, shot, source_stage)
             name = stage_name(shot, source_stage, source_object)
             notes.append(ignored_object(source_stage, source_object, "source_object"))
-            found = versions_of(folder, name)
+            found = result_versions(folder, name)
             version = source_version or max(found, default=0)
-            video = found.get(version)
-            if video is None:
-                wanted = f"{name}_v{version:0{padding}d}.mp4 not found" if source_version else f"no {name}_v###.mp4"
+            if version not in found:
+                wanted = (f"{name}_v{version:0{padding}d}.latent / .mp4 not found" if source_version
+                          else f"no {name}_v###.latent / .mp4")
                 raise FileNotFoundError(f"{stage} <- {source_stage}: {wanted} in {folder}; "
                                         f"available: {version_list(found, padding)}")
-            base = os.path.splitext(video)[0]
-            latent, frames = base + ".latent", base
+            # the paths as usual even when a file is missing: the node reading it reports that
+            base = os.path.splitext(found[version])[0]
+            video, latent, frames = base + ".mp4", base + ".latent", base
             info = f"{stage} <- {source_stage} {os.path.basename(base)}"
         notes = [n for n in notes if n]
         if notes:
             info += f" ({'; '.join(notes)})"
+        if video:
+            info += "".join(f" ({what})" for what, path in (("no mp4", video), ("no latent", latent))
+                            if not os.path.isfile(path))
         return (save_folder, new_folder, video, latent, frames, version, info)
 
 
@@ -187,10 +200,18 @@ def probe_video(path):
         return None
 
 
-def read_notes(video, meta=None):
-    """Notes Save Image Sequence stored with a video: its mp4 'notes' tag, else <name>.notes.txt; '' if none."""
+def is_mp4(path):
+    return path.lower().endswith(".mp4")
+
+
+def probe_mp4(path):
+    return probe_video(path) if is_mp4(path) else None
+
+
+def read_notes(source, meta=None):
+    """Notes Save Image Sequence stored with a result: its mp4 'notes' tag, else <name>.notes.txt; '' if none."""
     text = (meta or {}).get("notes", "")
-    path = os.path.splitext(video)[0] + ".notes.txt"
+    path = os.path.splitext(source)[0] + ".notes.txt"
     if not text.strip() and os.path.isfile(path):
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
@@ -254,7 +275,8 @@ def tree_size(path):
 class ShotFinalize:
     """Copy picked stage results into <shot>/final/<shot>_final_vNNN and, if confirmed, delete _tmp.
 
-    items: one result per line, '<stage> v<NNN> [object] [-> name]'. The
+    items: one result per line, '<stage> v<NNN> [object] [-> name]'; a result
+    with only its .latent (no mp4) brings that .latent. The
     manifest carries each result's notes and, for a base version, the notes of
     every base version up to it (what each pass added). Everything
     is checked before anything is copied; an existing final folder is never
@@ -320,24 +342,25 @@ class ShotFinalize:
         for stage, version, obj, target in parse_items(items):
             folder = stage_folder(root, shot, stage)
             name = stage_name(shot, stage, obj)
-            found = versions_of(folder, name)
+            found = result_versions(folder, name)
             ignored = ignored_object(stage, obj, "object")
             label = f"{stage} v{version:03d}" + (f" ({ignored})" if ignored else f" {obj}" if obj else "")
-            video = found.get(version)
-            if video is None:
-                problems.append(f"{label}: {name}_v{version:03d}.mp4 not found in {folder}; "
+            source = found.get(version)
+            if source is None:
+                problems.append(f"{label}: {name}_v{version:03d}.latent / .mp4 not found in {folder}; "
                                 f"available: {version_list(found)}")
                 continue
-            base = os.path.splitext(video)[0]
+            base, ext = os.path.splitext(source)
+            has_mp4 = ext.lower() == ".mp4"
             target = target or os.path.basename(base)
             if target in targets:
                 problems.append(f"{label}: name '{target}' is used twice in final")
             targets.add(target)
-            files = [(video, target + ".mp4")]
-            for ext in (".json", ".notes.txt"):
-                if os.path.isfile(base + ext):
-                    files.append((base + ext, target + ext))
-            if copy_latents:
+            files = [(source, target + ext.lower())]   # the mp4, or the .latent when there is none
+            for extra in (".json", ".notes.txt"):
+                if os.path.isfile(base + extra):
+                    files.append((base + extra, target + extra))
+            if copy_latents and has_mp4:
                 if os.path.isfile(base + ".latent"):
                     files.append((base + ".latent", target + ".latent"))
                 else:
@@ -345,9 +368,9 @@ class ShotFinalize:
             if copy_frames:
                 if os.path.isdir(base):
                     files.append((base, target))
-                else:
+                elif has_mp4:  # a .latent alone has no PNGs
                     problems.append(f"{label}: no PNG folder {os.path.basename(base)} (turn copy_frames off to skip)")
-            plan.append((label, video, files, version if stage == "base" else 0))
+            plan.append((label, source, files, version if stage == "base" else 0))
         if problems:
             raise FileNotFoundError("nothing was copied:\n" + "\n".join(problems))
 
@@ -414,31 +437,33 @@ class ShotFinalize:
     def _manifest(dest, shot, final_version, plan):
         out = [f"# {shot}_final_v{final_version:03d}", "",
                f"Collected {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ""]
-        for label, video, files, base_version in plan:
+        for label, source, files, base_version in plan:
             out.append(f"## {label} -> {files[0][1]}")
-            out.append(f"- source: `{video}`")
-            info = probe_video(video)
+            out.append(f"- source: `{source}`")
+            info = probe_mp4(source)
             meta = info[4] if info else {}
-            if info:
+            if not is_mp4(source):
+                out.append(f"- mp4 нет: only the .latent, {human_size(tree_size(source))}")
+            elif info:
                 w, h, n, fps, _ = info
                 out.append(f"- video: {w}x{h}, {n} frames, {fps:g} fps")
                 summary = prompt_summary(meta)
                 out += summary if summary else ["- no workflow / prompt in the file's metadata"]
             for src, name in files[1:]:
                 out.append(f"- {name}{'/' if os.path.isdir(src) else ''}: {human_size(tree_size(src))}")
-            notes = read_notes(video, meta)
+            notes = read_notes(source, meta)
             if notes:
                 out += ["", "notes:", ""] + notes_block(notes)
             if base_version:
                 # what each pass added, generation first
                 out += ["", "### История базы", ""]
-                found = versions_of(os.path.dirname(video), shot)
+                found = result_versions(os.path.dirname(source), shot)
                 for version in range(1, base_version + 1):
                     path = found.get(version)
                     if path is None:
                         out += [f"**v{version:03d}**: нет файла", ""]
                         continue
-                    probed = probe_video(path)
+                    probed = probe_mp4(path)
                     text = read_notes(path, probed[4] if probed else {})
                     out += [f"**v{version:03d}**" + ("" if text else ": нет notes"), ""]
                     if text:

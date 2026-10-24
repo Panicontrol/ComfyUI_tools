@@ -264,3 +264,38 @@ def test_h3_latent_resize_downscales_video_only():
 
     _, w, h = H3LatentResize().resize(latent, width=1000)      # height from the aspect, both on the 32 px grid
     assert (w, h) == (992, 576)
+
+
+def test_h3_latent_check_passes_or_lists_every_mismatch():
+    from comfyui_tools.latent_nodes import H3LatentCheck
+
+    check = H3LatentCheck().check
+    good = h3_latent(tokens=37, rows=48, cols=84)          # 1344x768, 124 frames, with audio
+    out = check(good, 1344, 768, 0, True, True)
+    assert out["result"][0] is good and out["result"][1] == "1344x768, 124 frames (5.17 s @24), audio yes"
+    assert check(good, 0, 0, 124, True, True)["result"][1] == out["result"][1]
+
+    with pytest.raises(ValueError, match=r"^latent check: 1280x720 \(expected 1344x768\)$"):
+        check(h3_latent(tokens=37, rows=45, cols=80), 1344, 768, 0, True, True)
+    with pytest.raises(ValueError, match=r"^latent check: 1280x768 \(expected width 1344\)$"):
+        check(h3_latent(tokens=37, rows=48, cols=80), 1344, 0, 0, True, True)
+
+    off_grid = h3_latent(tokens=36, rows=48, cols=84)      # 120 frames: the latent's own count
+    with pytest.raises(ValueError, match=r"^latent check: 120 frames not on 17k\+5 grid$"):
+        check(off_grid, 1344, 768, 0, True, True)
+    assert check(off_grid, 1344, 768, 0, False, True)["result"][1].startswith("1344x768, 120 frames (5.00 s @24)")
+    with pytest.raises(ValueError, match=r"^latent check: 124 frames \(expected 158\)$"):
+        check(good, 1344, 768, 158, True, True)
+
+    video_only = {"samples": torch.zeros(1, 24, 37, 48, 84)}
+    with pytest.raises(ValueError, match=r"^latent check: no audio part$"):
+        check(video_only, 1344, 768, 0, True, True)
+    assert check(video_only, 1344, 768, 0, True, False)["result"][1].endswith("audio no")
+
+    everything = {"samples": torch.zeros(1, 24, 36, 45, 80)}
+    with pytest.raises(ValueError) as error:
+        check(everything, 1344, 768, 0, True, True)
+    assert str(error.value) == "latent check: 1280x720 (expected 1344x768); 120 frames not on 17k+5 grid; no audio part"
+
+    with pytest.raises(ValueError, match="not a MiniMax H3 latent"):
+        check({"samples": torch.zeros(1, 16, 96, 168)}, 1344, 768, 0, True, True)

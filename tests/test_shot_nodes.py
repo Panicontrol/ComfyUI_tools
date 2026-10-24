@@ -39,13 +39,14 @@ def test_shot_paths_layout_latest_version_and_errors(tmp_path):
     before = ShotPaths.IS_CHANGED(str(tmp_path), "shot_01", "02_track", "fly", "01_generate", "", 0, 3)
     *_, video, latent, frames, version, info = paths(tmp_path)
     assert version == 2 and video.endswith("shot_01_v002.mp4") and frames.endswith("shot_01_v002")
-    assert info == "02_track <- 01_generate shot_01_v002"
+    assert info == "02_track <- 01_generate shot_01_v002 (no latent)"
+    assert paths(tmp_path, source_version=1)[6] == "02_track <- 01_generate shot_01_v001"
 
     render(tmp_path, "01_generate", "shot_01", 3)   # a new run: "latest" must move on
     assert ShotPaths.IS_CHANGED(str(tmp_path), "shot_01", "02_track", "fly", "01_generate", "", 0, 3) != before
     assert paths(tmp_path)[5] == 3
 
-    with pytest.raises(FileNotFoundError, match=r"shot_01_v004.mp4 not found in .*available: v001, v002, v003"):
+    with pytest.raises(FileNotFoundError, match=r"shot_01_v004.latent / .mp4 not found in .*available: v001, v002, v003"):
         paths(tmp_path, source_version=4)
     assert paths(tmp_path, stage="final")[0] == os.path.join(str(tmp_path), "shot_01", "final")
 
@@ -96,7 +97,7 @@ def test_shot_finalize_dry_run_copy_versions_and_delete(tmp_path):
 
 def test_shot_finalize_checks_everything_before_copying(tmp_path):
     render(tmp_path, "04_upscale", "shot_01", 3)
-    with pytest.raises(FileNotFoundError, match=r"02_track v004 fly: shot_01_fly_v004.mp4 not found"):
+    with pytest.raises(FileNotFoundError, match=r"02_track v004 fly: shot_01_fly_v004.latent / .mp4 not found"):
         finalize(tmp_path, dry_run=False)
     assert not (tmp_path / "shot_01" / "final").exists()
 
@@ -127,7 +128,7 @@ def test_shot_paths_base_chain(tmp_path):
     save, new, *_, info = paths(tmp_path, stage="base", object="", source_stage="none")
     assert save == base and new == "shot_01" and info == "base <- none"
     # a detail pass reads the latest base and saves the next one into the same folder
-    with pytest.raises(FileNotFoundError, match=r"base <- base: no shot_01_v###.mp4 .*available: none"):
+    with pytest.raises(FileNotFoundError, match=r"base <- base: no shot_01_v###.latent / .mp4 .*available: none"):
         paths(tmp_path, stage="base", object="", source_stage="base")
 
     render(tmp_path, "base", "shot_01", 1, latent=True)
@@ -145,7 +146,7 @@ def test_shot_paths_base_chain(tmp_path):
     render(tmp_path, "03_detail", "shot_01_fly", 1)
     *_, video, _, _, _, info = paths(tmp_path, stage="base", object="", source_stage="03_detail", source_object="fly")
     assert video.endswith(os.path.join("03_detail", "shot_01_fly_v001.mp4"))
-    assert info == "base <- 03_detail shot_01_fly_v001"
+    assert info == "base <- 03_detail shot_01_fly_v001 (no latent)"
     assert parse_items("base v003 -> final\nbase v001 -> generation") == [("base", 3, "", "final"), ("base", 1, "", "generation")]
 
 
@@ -195,3 +196,48 @@ def test_shot_finalize_base_history(tmp_path):
                                         "**v003**", "03_detail shot_01_face_v001", "**v004**: нет файла", "**v005**")]
     assert order == sorted(order)
     assert "### История базы" in generation and "**v002**" not in generation
+
+
+def drop_latent(root, stage, name, version):
+    """A .latent put into a stage folder by hand, with no mp4 (a base from elsewhere)."""
+    from comfyui_tools.latent_nodes import write_latent
+
+    folder = os.path.join(str(root), "shot_01", "_tmp", stage)
+    os.makedirs(folder, exist_ok=True)
+    write_latent(os.path.join(folder, f"{name}_v{version:03d}.latent"), {"samples": torch.zeros(1, 4, 2, 2)})
+    return folder
+
+
+def test_shot_paths_finds_versions_by_latent_or_mp4(tmp_path):
+    folder = drop_latent(tmp_path, "base", "shot_01", 1)
+    save, new, video, latent, frames, version, info = paths(tmp_path, stage="base", object="", source_stage="base")
+    assert version == 1 and info == "base <- base shot_01_v001 (no mp4)"
+    assert video == os.path.join(folder, "shot_01_v001.mp4") and not os.path.exists(video)  # the path all the same
+    assert latent == os.path.join(folder, "shot_01_v001.latent") and frames == os.path.join(folder, "shot_01_v001")
+
+    render(tmp_path, "base", "shot_01", 2, latent=True)
+    before = ShotPaths.IS_CHANGED(str(tmp_path), "shot_01", "base", "", "base", "", 0, 3)
+    drop_latent(tmp_path, "base", "shot_01", 3)                      # latest = a .latent alone
+    assert ShotPaths.IS_CHANGED(str(tmp_path), "shot_01", "base", "", "base", "", 0, 3) != before
+    assert paths(tmp_path, stage="base", object="", source_stage="base")[5:] == (3, "base <- base shot_01_v003 (no mp4)")
+    assert paths(tmp_path, stage="base", object="", source_stage="base", source_version=2)[6] == "base <- base shot_01_v002"
+    with pytest.raises(FileNotFoundError, match=r"shot_01_v004.latent / .mp4 not found .*available: v001, v002, v003"):
+        paths(tmp_path, stage="base", object="", source_stage="base", source_version=4)
+
+
+def test_shot_finalize_item_without_mp4(tmp_path):
+    folder = drop_latent(tmp_path, "base", "shot_01", 1)            # no notes at all
+    drop_latent(tmp_path, "base", "shot_01", 2)
+    with open(os.path.join(folder, "shot_01_v002.notes.txt"), "w", encoding="utf-8") as handle:
+        handle.write("shot_01_v002\nbase <- base shot_01_v001\n")
+    render(tmp_path, "base", "shot_01", 3, latent=True, notes="base <- base shot_01_v002")
+
+    # copy_latents off and copy_frames on: the .latent is still copied, and a missing PNG folder is fine
+    dest, report = finalize(tmp_path, items="base v002 -> final\nbase v003 -> preview", dry_run=False)
+    assert sorted(os.listdir(dest)) == ["final.latent", "final.notes.txt", "manifest.md",
+                                        "preview", "preview.mp4", "preview.notes.txt"]
+    manifest = open(os.path.join(dest, "manifest.md"), encoding="utf-8").read()
+    final, preview = manifest.split("## base v003 -> preview.mp4")
+    assert "## base v002 -> final.latent" in final and "- mp4 нет" in final and "- mp4 нет" not in preview
+    assert "**v001**: нет notes" in final and "base <- base shot_01_v001" in final
+    assert "**v002**: нет" not in preview and "base <- base shot_01_v002" in preview
