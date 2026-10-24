@@ -96,3 +96,24 @@ def test_shot_finalize_checks_everything_before_copying(tmp_path):
     with pytest.raises(FileNotFoundError, match=r"02_track v004 fly: shot_01_fly_v004.mp4 not found"):
         finalize(tmp_path, dry_run=False)
     assert not (tmp_path / "shot_01" / "final").exists()
+
+
+def test_merge_and_upscale_stages(tmp_path):
+    from comfyui_tools.shot_nodes import STAGES
+
+    assert STAGES.index("04_merge") < STAGES.index("05_upscale") < STAGES.index("04_upscale")
+    for stage in ("04_merge", "05_upscale"):
+        save = paths(tmp_path, stage=stage, object="", source_stage="none")[0]
+        assert save == os.path.join(str(tmp_path), "shot_01", "_tmp", stage)
+
+    render(tmp_path, "04_merge", "shot_01", 1, latent=True)
+    render(tmp_path, "04_merge", "shot_01", 2, latent=True)
+    *_, video, latent, frames, version, info = paths(tmp_path, stage="05_upscale", object="", source_stage="04_merge")
+    assert version == 2 and latent.endswith(os.path.join("04_merge", "shot_01_v002.latent")) and os.path.isfile(latent)
+
+    render(tmp_path, "05_upscale", "shot_01", 1, latent=True)
+    assert parse_items("05_upscale v001 -> final\n04_merge v002 -> merged") == [
+        ("05_upscale", 1, "", "final"), ("04_merge", 2, "", "merged")]
+    dest, report = finalize(tmp_path, items="05_upscale v001 -> final\n04_merge v002 -> merged",
+                            copy_latents=True, dry_run=False)
+    assert sorted(os.listdir(dest)) == ["final", "final.latent", "final.mp4", "manifest.md", "merged", "merged.latent", "merged.mp4"]

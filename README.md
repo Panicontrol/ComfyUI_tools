@@ -93,7 +93,7 @@ H3 audio VAE runs at, so LanPaint never has to resample (that path needs
 
 ### tools/shot
 
-Folders of a staged pipeline: `<root>/<shot>/_tmp/<stage>/<name>_vNNN.*` per stage (`01_generate`, `02_track`, `03_detail`, `04_upscale`), picked results in `<root>/<shot>/final/<shot>_final_vNNN/`.
+Folders of a staged pipeline: `<root>/<shot>/_tmp/<stage>/<name>_vNNN.*` per stage (`01_generate`, `02_track`, `03_detail`, `04_merge`, `05_upscale`; the older `04_upscale` still works), picked results in `<root>/<shot>/final/<shot>_final_vNNN/`.
 
 | Node | What it does |
 | --- | --- |

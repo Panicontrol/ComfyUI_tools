@@ -1,4 +1,4 @@
-"""Shot folder nodes for a staged pipeline (generate -> track -> detail -> upscale -> final).
+"""Shot folder nodes for a staged pipeline (generate -> track -> detail -> merge -> upscale -> final).
 
 Layout, shared by both nodes:
 
@@ -19,7 +19,8 @@ import shutil
 
 from .utils import CATEGORY
 
-STAGES = ["01_generate", "02_track", "03_detail", "04_upscale"]
+# 04_upscale stays, after the new stages, so graphs saved with it still load
+STAGES = ["01_generate", "02_track", "03_detail", "04_merge", "05_upscale", "04_upscale"]
 DEFAULT_ROOT = r"G:\.shortcut-targets-by-id\1pqdUrxPtcM0AFypHllKSnsTj8jXXqOtJ\26_project\mini_latent_control"
 
 
