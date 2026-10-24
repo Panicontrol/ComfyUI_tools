@@ -8,10 +8,12 @@ from comfyui_tools.image_nodes import SaveImageSequence
 from comfyui_tools.shot_nodes import ShotFinalize, ShotPaths, parse_items
 
 
-def render(root, stage, name, version, frames=2, latent=False, prompt=None):
+def render(root, stage, name, version, frames=2, latent=False, prompt=None, notes=None):
     """What Save Image Sequence writes for one stage version."""
     folder = os.path.join(root, "shot_01", "_tmp", stage)
     kwargs = {"latent": {"samples": torch.zeros(1, 4, 2, 2)}} if latent else {}
+    if notes is not None:
+        kwargs["notes"] = notes
     SaveImageSequence().save(torch.rand(frames, 8, 8, 3), folder, name, version, 1001, 5, False,
                              prompt=prompt, extra_pnginfo={"workflow": {"id": "wf-1", "nodes": []}}, **kwargs)
     return folder
@@ -26,9 +28,10 @@ def paths(root, **kw):
 
 def test_shot_paths_layout_latest_version_and_errors(tmp_path):
     # no folders yet: paths are fine, only the source is an error
-    save, new, *_ = paths(tmp_path, source_stage="none")
+    save, new, *_, info = paths(tmp_path, source_stage="none")
     assert save == os.path.join(str(tmp_path), "shot_01", "_tmp", "02_track") and new == "shot_01_fly"
-    with pytest.raises(FileNotFoundError):
+    assert info == "02_track <- none"
+    with pytest.raises(FileNotFoundError, match="available: none"):
         paths(tmp_path)
 
     render(tmp_path, "01_generate", "shot_01", 1, latent=True)
@@ -36,7 +39,7 @@ def test_shot_paths_layout_latest_version_and_errors(tmp_path):
     before = ShotPaths.IS_CHANGED(str(tmp_path), "shot_01", "02_track", "fly", "01_generate", "", 0, 3)
     *_, video, latent, frames, version, info = paths(tmp_path)
     assert version == 2 and video.endswith("shot_01_v002.mp4") and frames.endswith("shot_01_v002")
-    assert "latest" in info and "no .latent" in info
+    assert info == "02_track <- 01_generate shot_01_v002"
 
     render(tmp_path, "01_generate", "shot_01", 3)   # a new run: "latest" must move on
     assert ShotPaths.IS_CHANGED(str(tmp_path), "shot_01", "02_track", "fly", "01_generate", "", 0, 3) != before
@@ -117,3 +120,78 @@ def test_merge_and_upscale_stages(tmp_path):
     dest, report = finalize(tmp_path, items="05_upscale v001 -> final\n04_merge v002 -> merged",
                             copy_latents=True, dry_run=False)
     assert sorted(os.listdir(dest)) == ["final", "final.latent", "final.mp4", "manifest.md", "merged", "merged.latent", "merged.mp4"]
+
+
+def test_shot_paths_base_chain(tmp_path):
+    base = os.path.join(str(tmp_path), "shot_01", "_tmp", "base")
+    save, new, *_, info = paths(tmp_path, stage="base", object="", source_stage="none")
+    assert save == base and new == "shot_01" and info == "base <- none"
+    # a detail pass reads the latest base and saves the next one into the same folder
+    with pytest.raises(FileNotFoundError, match=r"base <- base: no shot_01_v###.mp4 .*available: none"):
+        paths(tmp_path, stage="base", object="", source_stage="base")
+
+    render(tmp_path, "base", "shot_01", 1, latent=True)
+    render(tmp_path, "base", "shot_01", 2, latent=True)
+    save, new, video, latent, _, version, info = paths(tmp_path, stage="base", object="", source_stage="base")
+    assert (save, new, version) == (base, "shot_01", 2) and latent == os.path.join(base, "shot_01_v002.latent")
+    assert info == "base <- base shot_01_v002"
+    assert paths(tmp_path, stage="base", object="", source_stage="base", source_version=1)[3].endswith("shot_01_v001.latent")
+
+    # base has no objects: given ones are ignored, and info says so
+    _, new, *_, info = paths(tmp_path, stage="base", object="fly", source_stage="base", source_object="fly")
+    assert new == "shot_01" and info.startswith("base <- base shot_01_v002 (")
+    assert "object 'fly' ignored" in info and "source_object 'fly' ignored" in info
+
+    render(tmp_path, "03_detail", "shot_01_fly", 1)
+    *_, video, _, _, _, info = paths(tmp_path, stage="base", object="", source_stage="03_detail", source_object="fly")
+    assert video.endswith(os.path.join("03_detail", "shot_01_fly_v001.mp4"))
+    assert info == "base <- 03_detail shot_01_fly_v001"
+    assert parse_items("base v003 -> final\nbase v001 -> generation") == [("base", 3, "", "final"), ("base", 1, "", "generation")]
+
+
+def mp4_tags(path):
+    import av
+
+    with av.open(path) as container:
+        return dict(container.metadata)
+
+
+def test_save_notes(tmp_path):
+    folder = render(tmp_path, "base", "shot_01", 1, notes="")
+    assert not os.path.exists(os.path.join(folder, "shot_01_v001.notes.txt"))
+    tags = mp4_tags(os.path.join(folder, "shot_01_v001.mp4"))
+    assert "notes" not in tags and json.loads(tags["workflow"])["id"] == "wf-1"
+    render(tmp_path, "base", "shot_01", 2, notes="  \n")   # whitespace only is empty too
+    assert not os.path.exists(os.path.join(folder, "shot_01_v002.notes.txt"))
+
+    notes = "base <- base shot_01_v002\nbase <- 03_detail shot_01_fly_v001\nbase <- 02_track shot_01_fly_v001"
+    render(tmp_path, "base", "shot_01", 3, notes=notes)
+    tags = mp4_tags(os.path.join(folder, "shot_01_v003.mp4"))
+    assert tags["notes"] == "shot_01_v003\n" + notes and "workflow" in tags
+    text = open(os.path.join(folder, "shot_01_v003.notes.txt"), encoding="utf-8").read()
+    assert text.splitlines()[0] == "shot_01_v003" and text.strip() == tags["notes"]
+
+    # an existing notes file is not overwritten either
+    os.remove(os.path.join(folder, "shot_01_v003.mp4"))
+    with pytest.raises(ValueError, match="shot_01_v003.notes.txt already exists"):
+        render(tmp_path, "base", "shot_01", 3, notes=notes)
+
+
+def test_shot_finalize_base_history(tmp_path):
+    render(tmp_path, "base", "shot_01", 1, notes="base <- none")
+    render(tmp_path, "base", "shot_01", 2)                     # no notes in the mp4 ...
+    folder = render(tmp_path, "base", "shot_01", 3, notes="base <- base shot_01_v002\nbase <- 03_detail shot_01_face_v001")
+    with open(os.path.join(folder, "shot_01_v002.notes.txt"), "w", encoding="utf-8") as handle:
+        handle.write("shot_01_v002\nbase <- 03_detail shot_01_fly_v001\n")   # ... but a notes file
+    render(tmp_path, "base", "shot_01", 5, notes="base <- base shot_01_v003")   # v004 is missing
+
+    dest, report = finalize(tmp_path, items="base v005 -> final\nbase v001 -> generation", dry_run=False, copy_frames=False)
+    assert sorted(os.listdir(dest)) == ["final.mp4", "final.notes.txt", "generation.mp4", "generation.notes.txt", "manifest.md"]
+    manifest = open(os.path.join(dest, "manifest.md"), encoding="utf-8").read()
+    final, generation = manifest.split("## base v001 -> generation")
+    assert "notes:" in final and "base <- base shot_01_v003" in final
+    history = final.split("### История базы")[1]
+    order = [history.index(s) for s in ("**v001**", "base <- none", "**v002**", "03_detail shot_01_fly_v001",
+                                        "**v003**", "03_detail shot_01_face_v001", "**v004**: нет файла", "**v005**")]
+    assert order == sorted(order)
+    assert "### История базы" in generation and "**v002**" not in generation

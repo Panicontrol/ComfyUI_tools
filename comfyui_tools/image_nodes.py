@@ -575,12 +575,14 @@ class SaveImageSequence:
     In <save_folder>, for new_folder = depth and version 4:
       depth_v004.mp4                        always
       depth_v004.latent                     latent connected: for Load Latent From
+      depth_v004.notes.txt                  notes connected: "depth_v004" + the notes
       depth_v004.zip                        need_zip: the frames, zipped
       depth_v004/depth_v004.01001.png ...   need_save: the frames
 
     number_version has ComfyUI's "control after generate" switch, set to
     increment, so every run is a new version. Masks go into the PNGs' alpha
-    channel (1 - mask), which Load Image Sequence reads back as masks.
+    channel (1 - mask), which Load Image Sequence reads back as masks. Notes
+    also go into the mp4 as its 'notes' tag.
     """
 
     @classmethod
@@ -632,6 +634,12 @@ class SaveImageSequence:
                     "tooltip": "Also save this latent next to the video as <name>_v###.latent "
                                "(MiniMax H3 video+audio included); load it with Load Latent From.",
                 }),
+                "notes": ("STRING", {
+                    "forceInput": True,
+                    "tooltip": "What this version is made of, e.g. the info of the graph's Shot Paths joined "
+                               "with Text Concat. Saved under the version name as the mp4's notes tag and "
+                               "as <name>_v###.notes.txt; empty = neither.",
+                }),
             },
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
@@ -646,8 +654,8 @@ class SaveImageSequence:
 
     def save(self, images, save_folder, new_folder, number_version, start_frame_index,
              padding_frame_name, overwrite, masks=None, frame_rate=24.0, need_save=True,
-             need_zip=False, embed_workflow=True, save_workflow_json=False, latent=None, prompt=None,
-             extra_pnginfo=None):
+             need_zip=False, embed_workflow=True, save_workflow_json=False, latent=None, notes=None,
+             prompt=None, extra_pnginfo=None):
         import io
         import zipfile
 
@@ -664,6 +672,9 @@ class SaveImageSequence:
         zip_path = os.path.join(project, f"{versioned}.zip")
         json_path = os.path.join(project, f"{versioned}.json")
         latent_path = os.path.join(project, f"{versioned}.latent") if latent is not None else ""
+        # the version name first, so the text says which file it belongs to
+        notes_text = f"{versioned}\n{notes}" if notes is not None and str(notes).strip() else ""
+        notes_path = os.path.join(project, f"{versioned}.notes.txt") if notes_text else ""
 
         frames = int(images.shape[0])
         names = [
@@ -678,6 +689,8 @@ class SaveImageSequence:
             targets.append(json_path)
         if latent_path:
             targets.append(latent_path)
+        if notes_path:
+            targets.append(notes_path)
         if need_save:
             targets += [os.path.join(folder, n) for n in names]
         if not overwrite:
@@ -724,7 +737,12 @@ class SaveImageSequence:
                     archive.close()
 
         metadata = workflow_metadata(prompt, extra_pnginfo) if embed_workflow else None
+        if notes_text:
+            metadata = {**(metadata or {}), "notes": notes_text}
         write_mp4(video_path, pixels, float(frame_rate), metadata)
+        if notes_path:
+            with open(notes_path, "w", encoding="utf-8") as handle:
+                handle.write(notes_text + "\n")
 
         if save_workflow_json:
             # the UI graph loads back by dropping the file on ComfyUI; a run

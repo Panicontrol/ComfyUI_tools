@@ -2,13 +2,15 @@
 
 Layout, shared by both nodes:
 
-    <root>/<shot>/_tmp/<stage>/<name>_vNNN.mp4 | .latent | .json | <name>_vNNN/ (PNG)
+    <root>/<shot>/_tmp/<stage>/<name>_vNNN.mp4 | .latent | .json | .notes.txt | <name>_vNNN/ (PNG)
     <root>/<shot>/final/<shot>_final_vNNN/      picked results + manifest.md
 
 <name> is <shot> or <shot>_<object>, the way Save Image Sequence names its
-files (<new_folder>_vNNN). Shot Paths hands every stage its folders and finds
-its source; Shot Finalize copies picked results into a new final folder and,
-only when confirmed, deletes _tmp.
+files (<new_folder>_vNNN). base is the shot's one versioned chain, always
+<shot>_vNNN: generation writes v001 and every detail pass reads the latest
+version and writes the next. Shot Paths hands every stage its folders and
+finds its source; Shot Finalize copies picked results into a new final folder
+and, only when confirmed, deletes _tmp.
 """
 
 import datetime
@@ -19,8 +21,8 @@ import shutil
 
 from .utils import CATEGORY
 
-# 04_upscale stays, after the new stages, so graphs saved with it still load
-STAGES = ["01_generate", "02_track", "03_detail", "04_merge", "05_upscale", "04_upscale"]
+# 01_generate, 04_merge and 04_upscale stay so graphs saved with them still load
+STAGES = ["base", "01_generate", "02_track", "03_detail", "04_merge", "05_upscale", "04_upscale"]
 DEFAULT_ROOT = r"G:\.shortcut-targets-by-id\1pqdUrxPtcM0AFypHllKSnsTj8jXXqOtJ\26_project\mini_latent_control"
 
 
@@ -33,6 +35,17 @@ def stem_name(shot, obj=""):
     if not shot:
         raise ValueError("give the node a shot name")
     return f"{shot}_{obj}" if obj else shot
+
+
+def stage_name(shot, stage, obj=""):
+    """<name> of a stage's files; base has no objects, so obj is dropped there."""
+    return stem_name(shot, "" if stage == "base" else obj)
+
+
+def ignored_object(stage, obj, field):
+    """Note for info when an object is given to base, which has none."""
+    obj = str(obj).strip()
+    return f"{field} '{obj}' ignored: base has no objects" if stage == "base" and obj else ""
 
 
 def stage_folder(root, shot, stage):
@@ -59,7 +72,10 @@ class ShotPaths:
     """Every path one stage of one shot needs, so a graph sets the shot in one place.
 
     save_folder / new_folder go to Save Image Sequence; source_* point at the
-    output of source_stage (0 = its latest version). Creates no folders.
+    output of source_stage (0 = its latest version). stage base with source
+    base is a detail pass: it reads the latest base and Save writes the next
+    one. info is one line, '<stage> <- <source_stage> <file name>', for the
+    notes of Save Image Sequence. Creates no folders.
     """
 
     @classmethod
@@ -70,11 +86,13 @@ class ShotPaths:
                 "shot": ("STRING", {"default": "shot_01"}),
                 "stage": (STAGES + ["final"], {"default": "01_generate",
                                                "tooltip": "Where this graph writes."}),
-                "object": ("STRING", {"default": "", "tooltip": "Object name (stages 02/03); empty = none."}),
+                "object": ("STRING", {"default": "",
+                                      "tooltip": "Object name (stages 02/03); empty = none. Ignored for base."}),
                 "source_stage": (["none"] + STAGES, {"default": "none",
                                                      "tooltip": "Stage this graph reads its input from."}),
                 "source_object": ("STRING", {"default": "",
-                                             "tooltip": "Object of the source, if it is per object (02_track)."}),
+                                             "tooltip": "Object of the source, if it is per object (02_track, "
+                                                        "03_detail). Ignored for base."}),
                 "source_version": ("INT", {"default": 0, "min": 0, "max": 9999,
                                            "tooltip": "0 = the latest existing version."}),
                 "padding": ("INT", {"default": 3, "min": 1, "max": 6, "tooltip": "Digits in version numbers."}),
@@ -107,33 +125,29 @@ class ShotPaths:
             save_folder = os.path.join(root, shot, "final")
         else:
             save_folder = stage_folder(root, shot, stage)
-        new_folder = stem_name(shot, object)
+        new_folder = stage_name(shot, stage, object)
+        notes = [ignored_object(stage, object, "object")]
 
         video = latent = frames = ""
         version = 0
-        info = f"{shot}/{stage}: save to {save_folder} as {new_folder}_v###"
+        info = f"{stage} <- none"
         if source_stage != "none":
             folder = stage_folder(root, shot, source_stage)
-            name = stem_name(shot, source_object)
+            name = stage_name(shot, source_stage, source_object)
+            notes.append(ignored_object(source_stage, source_object, "source_object"))
             found = versions_of(folder, name)
-            if source_version == 0:
-                if not found:
-                    raise FileNotFoundError(f"{stage}: no {name}_v###.mp4 in {folder}")
-                version = max(found)
-                video = found[version]
-            else:
-                version = source_version
-                video = found.get(version)
-                if video is None:
-                    raise FileNotFoundError(
-                        f"{stage}: {name}_v{version:0{padding}d}.mp4 not found in {folder}; "
-                        f"available: {version_list(found, padding)}")
+            version = source_version or max(found, default=0)
+            video = found.get(version)
+            if video is None:
+                wanted = f"{name}_v{version:0{padding}d}.mp4 not found" if source_version else f"no {name}_v###.mp4"
+                raise FileNotFoundError(f"{stage} <- {source_stage}: {wanted} in {folder}; "
+                                        f"available: {version_list(found, padding)}")
             base = os.path.splitext(video)[0]
             latent, frames = base + ".latent", base
-            info += (f"; source {source_stage} v{version:0{padding}d}"
-                     f"{' (latest)' if source_version == 0 else ''}: {os.path.basename(video)}"
-                     f"{'' if os.path.isfile(latent) else ', no .latent'}"
-                     f"{'' if os.path.isdir(frames) else ', no PNG folder'}")
+            info = f"{stage} <- {source_stage} {os.path.basename(base)}"
+        notes = [n for n in notes if n]
+        if notes:
+            info += f" ({'; '.join(notes)})"
         return (save_folder, new_folder, video, latent, frames, version, info)
 
 
@@ -141,7 +155,7 @@ ITEM_RE = re.compile(r"^(?P<stage>\S+)\s+v?(?P<version>\d+)(?:\s+(?P<object>[^\s
 
 
 def parse_items(text):
-    """'04_upscale v003 -> final', '02_track v004 fly -> mask_fly' -> [(stage, version, object, target)]."""
+    """'base v003 -> final', '02_track v004 fly -> mask_fly' -> [(stage, version, object, target)]."""
     items = []
     for number, raw in enumerate(str(text).replace("\r\n", "\n").split("\n"), 1):
         line = raw.split("#", 1)[0].strip()
@@ -171,6 +185,20 @@ def probe_video(path):
             return stream.width, stream.height, frames, fps, dict(container.metadata)
     except Exception:
         return None
+
+
+def read_notes(video, meta=None):
+    """Notes Save Image Sequence stored with a video: its mp4 'notes' tag, else <name>.notes.txt; '' if none."""
+    text = (meta or {}).get("notes", "")
+    path = os.path.splitext(video)[0] + ".notes.txt"
+    if not text.strip() and os.path.isfile(path):
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    return text.strip()
+
+
+def notes_block(text):
+    return ["```text", text, "```"]
 
 
 def prompt_summary(meta):
@@ -226,7 +254,9 @@ def tree_size(path):
 class ShotFinalize:
     """Copy picked stage results into <shot>/final/<shot>_final_vNNN and, if confirmed, delete _tmp.
 
-    items: one result per line, '<stage> v<NNN> [object] [-> name]'. Everything
+    items: one result per line, '<stage> v<NNN> [object] [-> name]'. The
+    manifest carries each result's notes and, for a base version, the notes of
+    every base version up to it (what each pass added). Everything
     is checked before anything is copied; an existing final folder is never
     touched; _tmp goes only after every copy worked, only with confirm_delete
     set to the shot name, and only the shot's own _tmp folder (to the recycle
@@ -241,8 +271,8 @@ class ShotFinalize:
                 "shot": ("STRING", {"default": "shot_01"}),
                 "items": ("STRING", {
                     "multiline": True,
-                    "default": "04_upscale v003            -> final\n02_track   v004 fly        -> mask_fly\n"
-                               "01_generate v002           -> base",
+                    "default": "base     v003       -> final\nbase     v001       -> generation\n"
+                               "02_track v001 fly   -> mask_fly",
                     "tooltip": "One result per line: <stage> v<NNN> [object] [-> name in final]. # starts a comment.",
                 }),
                 "final_version": ("INT", {"default": 0, "min": 0, "max": 9999,
@@ -289,9 +319,10 @@ class ShotFinalize:
         plan, problems, targets = [], [], set()
         for stage, version, obj, target in parse_items(items):
             folder = stage_folder(root, shot, stage)
-            name = stem_name(shot, obj)
+            name = stage_name(shot, stage, obj)
             found = versions_of(folder, name)
-            label = f"{stage} v{version:03d}{' ' + obj if obj else ''}"
+            ignored = ignored_object(stage, obj, "object")
+            label = f"{stage} v{version:03d}" + (f" ({ignored})" if ignored else f" {obj}" if obj else "")
             video = found.get(version)
             if video is None:
                 problems.append(f"{label}: {name}_v{version:03d}.mp4 not found in {folder}; "
@@ -303,8 +334,9 @@ class ShotFinalize:
                 problems.append(f"{label}: name '{target}' is used twice in final")
             targets.add(target)
             files = [(video, target + ".mp4")]
-            if os.path.isfile(base + ".json"):
-                files.append((base + ".json", target + ".json"))
+            for ext in (".json", ".notes.txt"):
+                if os.path.isfile(base + ext):
+                    files.append((base + ext, target + ext))
             if copy_latents:
                 if os.path.isfile(base + ".latent"):
                     files.append((base + ".latent", target + ".latent"))
@@ -315,15 +347,15 @@ class ShotFinalize:
                     files.append((base, target))
                 else:
                     problems.append(f"{label}: no PNG folder {os.path.basename(base)} (turn copy_frames off to skip)")
-            plan.append((label, video, files))
+            plan.append((label, video, files, version if stage == "base" else 0))
         if problems:
             raise FileNotFoundError("nothing was copied:\n" + "\n".join(problems))
 
-        total = sum(tree_size(src) for _, _, files in plan for src, _ in files)
+        total = sum(tree_size(src) for _, _, files, _ in plan for src, _ in files)
         tmp_dir = os.path.join(shot_dir, "_tmp")
         wants_delete = delete_tmp and confirm_delete.strip() == shot
         lines = [f"{'PLAN (dry run)' if dry_run else 'DONE'}: {shot} -> {dest}", ""]
-        for label, _, files in plan:
+        for label, _, files, _ in plan:
             lines.append(label + ":")
             lines += [f"  {os.path.basename(src)} -> {name}{os.sep if os.path.isdir(src) else ''}"
                       f"  ({human_size(tree_size(src))})" for src, name in files]
@@ -339,7 +371,7 @@ class ShotFinalize:
         os.makedirs(final_root, exist_ok=True)
         os.makedirs(dest)
         try:
-            for _, _, files in plan:
+            for _, _, files, _ in plan:
                 for src, name in files:
                     out = os.path.join(dest, name)
                     if os.path.isdir(src):
@@ -382,17 +414,35 @@ class ShotFinalize:
     def _manifest(dest, shot, final_version, plan):
         out = [f"# {shot}_final_v{final_version:03d}", "",
                f"Collected {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ""]
-        for label, video, files in plan:
+        for label, video, files, base_version in plan:
             out.append(f"## {label} -> {files[0][1]}")
             out.append(f"- source: `{video}`")
             info = probe_video(video)
+            meta = info[4] if info else {}
             if info:
-                w, h, n, fps, meta = info
+                w, h, n, fps, _ = info
                 out.append(f"- video: {w}x{h}, {n} frames, {fps:g} fps")
                 summary = prompt_summary(meta)
                 out += summary if summary else ["- no workflow / prompt in the file's metadata"]
             for src, name in files[1:]:
                 out.append(f"- {name}{'/' if os.path.isdir(src) else ''}: {human_size(tree_size(src))}")
+            notes = read_notes(video, meta)
+            if notes:
+                out += ["", "notes:", ""] + notes_block(notes)
+            if base_version:
+                # what each pass added, generation first
+                out += ["", "### История базы", ""]
+                found = versions_of(os.path.dirname(video), shot)
+                for version in range(1, base_version + 1):
+                    path = found.get(version)
+                    if path is None:
+                        out += [f"**v{version:03d}**: нет файла", ""]
+                        continue
+                    probed = probe_video(path)
+                    text = read_notes(path, probed[4] if probed else {})
+                    out += [f"**v{version:03d}**" + ("" if text else ": нет notes"), ""]
+                    if text:
+                        out += notes_block(text) + [""]
             out.append("")
         with open(os.path.join(dest, "manifest.md"), "w", encoding="utf-8") as handle:
             handle.write("\n".join(out))
