@@ -22,7 +22,9 @@ from .utils import CATEGORY
 U = 1.0 / 255.0
 PARITY_SIGMA = 2.0
 PARITY_LIMIT = 1.5 * U
+EDGE_WEIGHTS = ["above grain", "linear"]
 CLEAN_BELOW = 1.05
+PLATEAU_FLAT_SHARE = 0.75  # a block takes part in plateau when this share of it is flat
 OTHER_GRID_BELOW = 1.15  # a weak grid at period, the frame's own grid elsewhere: resized, leave it
 FLAT_PERCENTILE = 0.4
 
@@ -89,13 +91,19 @@ def boundary_centres(size, period, phase):
     return [phase + k * period - 0.5 for k in range(k0, k1 + 1)]
 
 
-def deblock_axis(x, period, phase, max_corr, edge_thr, smooth_along, dim):
+def deblock_axis(x, period, phase, max_corr, edge_thr, smooth_along, dim, edge_weight="above grain"):
     """Correction for the block boundaries across dim (3 = vertical lines, 2 = horizontal).
 
     Per boundary: the step across it minus the mean of the steps beside it,
     faded out where those steps are a real edge, smoothed along the line,
     limited, and spread as a ramp over period / 2 px on each side (half up on
     the low side, half down on the high side, most at the boundary).
+
+    The fade: linear, 1 - step / edge_thr, already takes ~13% off every jump
+    on flat ground, whose grain alone makes steps of ~0.8 (0-255); above grain
+    measures the steps above the frame's usual one (its median, at most a
+    third of edge_thr), so flat ground is corrected in full and edges still
+    are not.
     """
     t = x.movedim(dim, -1)
     length = t.shape[-1]
@@ -106,7 +114,12 @@ def deblock_axis(x, period, phase, max_corr, edge_thr, smooth_along, dim):
     v = [sample_last(t, u + o) for o in (-1.5, -0.5, 0.5, 1.5)]
     d_before, d_across, d_after = v[1] - v[0], v[2] - v[1], v[3] - v[2]
     excess = d_across - (d_before + d_after) / 2
-    weight = (1 - torch.maximum(d_before.abs(), d_after.abs()) / edge_thr).clamp(0, 1)
+    beside = torch.maximum(d_before.abs(), d_after.abs())
+    if edge_weight == "linear":
+        weight = (1 - beside / edge_thr).clamp(0, 1)
+    else:
+        grain = beside.flatten(-2).median(-1).values[..., None, None].clamp(max=edge_thr / 3)
+        weight = (1 - (beside - grain).clamp(min=0) / (edge_thr - grain)).clamp(0, 1)
     corr = blur(excess * weight, smooth_along, [2]).clamp(-max_corr, max_corr)
 
     # every pixel takes the ramp of its nearest boundary
@@ -119,26 +132,33 @@ def deblock_axis(x, period, phase, max_corr, edge_thr, smooth_along, dim):
     return (corr.index_select(-1, nearest) * coef).movedim(-1, dim)
 
 
-def parity_axis(x, dim):
-    """The 2 px alternation along dim: the Nyquist component, demodulated, smoothed and
-    limited (subtract it)."""
+def parity_axis(x, dim, weight):
+    """The 2 px alternation along dim: the Nyquist component, demodulated and smoothed
+    with weights (a normalized convolution, so dense texture next to a calm area does not
+    leak into its estimate), limited. Subtract it."""
     k = torch.tensor([1.0, -4.0, 6.0, -4.0, 1.0], device=x.device) / 16
     n = x.shape[dim]
     shape = [1, 1, 1, 1]
     shape[dim] = n
     sign = (1.0 - 2.0 * (torch.arange(n, device=x.device) % 2).to(x.dtype)).view(shape)
-    amp = blur(conv_axis(x, k, dim) * sign, PARITY_SIGMA, [3, 2])
+    amp = blur(conv_axis(x, k, dim) * sign * weight, PARITY_SIGMA, [3, 2])
+    amp = amp / blur(weight, PARITY_SIGMA, [3, 2]).clamp(min=0.05)
     return amp.clamp(-PARITY_LIMIT, PARITY_LIMIT) * sign
 
 
 def parity_correction(x, edge_thr):
-    """Correction for the 2 px parity along x and y. It fades out where the mean step is
-    as large as edge_thr: in dense texture the filter would take real detail."""
+    """Correction for the 2 px parity along x and y, weighted by how calm the picture is:
+    where the mean step reaches edge_thr (dense texture) the filter would take real detail,
+    so it does nothing there.
+
+    One pass: a second one, before deblocking, mostly takes the filter's answer to the
+    block steps, and after it the answer to the ramps' kinks; both made grid and parity
+    worse in tests."""
     dx = (x[..., :, 1:] - x[..., :, :-1]).abs()
     dy = (x[..., 1:, :] - x[..., :-1, :]).abs()
     steps = (F.pad(dx, (1, 0, 0, 0), mode="replicate") + F.pad(dy, (0, 0, 1, 0), mode="replicate")) / 2
     calm = (1 - blur(steps, PARITY_SIGMA, [3, 2]) / edge_thr).clamp(0, 1)
-    return -(parity_axis(x, 3) + parity_axis(x, 2)) * calm
+    return -(parity_axis(x, 3, calm) + parity_axis(x, 2, calm)) * calm
 
 
 def block_index(size, period, phase, device):
@@ -182,46 +202,50 @@ def percentile_per_frame(t, q):
 
 
 def plateau_correction(x, period, phase_x, phase_y, max_corr, edge_thr):
-    """Pull flat blocks towards a smooth surface through their neighbours.
+    """Pull the tone of flat blocks towards a smooth surface through their neighbours.
 
-    Block means are compared with the mean of their (similar) 8 neighbours;
-    the difference, limited, is spread bilinearly between block centres, so
-    only the tone of the plateau moves and the texture inside stays.
+    Only flat ground takes part: a block's tone is the mean of its flat pixels
+    (local sigma below the frame's 40th percentile), only blocks that are
+    mostly flat are corrected or used as neighbours, and neighbours across a
+    real step in tone are left out. The difference to the neighbours' mean,
+    limited, is spread bilinearly between block centres and faded out near
+    edges and texture, so an edge through a block (a windowsill) is never
+    shifted and only the plateau's tone moves, not its texture.
     """
     n, c, h, w = x.shape
     bx = block_index(w, period, phase_x, x.device)
     by = block_index(h, period, phase_y, x.device)
     nbx, nby = int(bx.max()) + 1, int(by.max()) + 1
-    sums = torch.zeros(n, c, h, nbx, device=x.device).index_add_(3, bx, x)
-    sums = torch.zeros(n, c, nby, nbx, device=x.device).index_add_(2, by, sums)
-    counts = torch.outer(torch.bincount(by), torch.bincount(bx)).to(x.dtype)
-    means = sums / counts
 
-    # neighbours that are not across a real edge
-    padded = F.pad(means, (1, 1, 1, 1), mode="replicate")
+    def per_block(t):
+        t = torch.zeros(n, c, h, nbx, device=x.device).index_add_(3, bx, t)
+        return torch.zeros(n, c, nby, nbx, device=x.device).index_add_(2, by, t)
+
+    sigma = local_sigma(x)
+    flat = (sigma < percentile_per_frame(sigma, FLAT_PERCENTILE)).to(x.dtype)
+    flat_count = per_block(flat)
+    counts = torch.outer(torch.bincount(by), torch.bincount(bx)).to(x.dtype)
+    valid = (flat_count >= PLATEAU_FLAT_SHARE * counts).to(x.dtype)
+    means = per_block(x * flat) / flat_count.clamp(min=1)
+
+    padded_m = F.pad(means, (1, 1, 1, 1), mode="replicate")
+    padded_v = F.pad(valid, (1, 1, 1, 1))
     total = torch.zeros_like(means)
     used = torch.zeros_like(means)
     for dy in (0, 1, 2):
         for dx in (0, 1, 2):
             if dy == 1 and dx == 1:
                 continue
-            nb = padded[..., dy:dy + nby, dx:dx + nbx]
-            ok = ((nb - means).abs() <= edge_thr).to(x.dtype)
+            nb = padded_m[..., dy:dy + nby, dx:dx + nbx]
+            ok = padded_v[..., dy:dy + nby, dx:dx + nbx] * ((nb - means).abs() <= edge_thr).to(x.dtype)
             total += nb * ok
             used += ok
-    target = torch.where(used > 0, total / used.clamp(min=1), means)
-    delta = (target - means).clamp(-max_corr, max_corr)
-
-    # only blocks on flat ground
-    sigma = local_sigma(x)
-    flat_thr = percentile_per_frame(sigma, FLAT_PERCENTILE)
-    flat = (sigma < flat_thr).to(x.dtype)
-    flat_share = torch.zeros(n, c, h, nbx, device=x.device).index_add_(3, bx, flat)
-    flat_share = torch.zeros(n, c, nby, nbx, device=x.device).index_add_(2, by, flat_share) / counts
-    delta = delta * (flat_share > 0.5).to(x.dtype)
+    delta = torch.where(used >= 3, total / used.clamp(min=1) - means, torch.zeros_like(means))
+    delta = delta.clamp(-max_corr, max_corr) * valid
 
     field = bilinear_from_centres(delta, w, period, phase_x, 3)
-    return bilinear_from_centres(field, h, period, phase_y, 2)
+    field = bilinear_from_centres(field, h, period, phase_y, 2)
+    return field * blur(flat, 1.5, [3, 2])
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +415,16 @@ class H3DeGrid:
                 "skip_when_clean": ("BOOLEAN", {"default": True,
                                                 "tooltip": "Frames whose grid (and parity) measure below 1.05 "
                                                            "pass through untouched."}),
+                "h3_sizes_only": ("BOOLEAN", {"default": True,
+                                              "tooltip": "Only frames whose sides are multiples of 32 px -- H3's "
+                                                         "own sizes (1344x768, 1920x1088, 2880x1632, ...) -- are "
+                                                         "processed; others (fal 4K 3840x2160, 1080p) pass "
+                                                         "through untouched."}),
+                "edge_weight": (EDGE_WEIGHTS, {"default": "above grain",
+                                               "tooltip": "How the correction fades towards real edges. above "
+                                                          "grain: by the steps beside a boundary above the frame's "
+                                                          "usual (grain) step, so flat ground is corrected in full. "
+                                                          "linear: by the whole step, as first specified."}),
             },
             "optional": {
                 "mask": ("MASK", {"tooltip": "Where to work (white); none = the whole frame."}),
@@ -406,10 +440,16 @@ class H3DeGrid:
 
     def degrid(self, images, period=8.0, phase_x=0.0, phase_y=0.0, strength=1.0, max_correction=4.0,
                edge_threshold=6.0, smooth_along=3.0, plateau="off", parity=True, skip_when_clean=True,
-               mask=None):
+               h3_sizes_only=True, edge_weight="above grain", mask=None):
         device = compute_device()
         count, height, width = int(images.shape[0]), int(images.shape[1]), int(images.shape[2])
         max_corr, edge_thr = max_correction * U, edge_threshold * U
+
+        if h3_sizes_only and (width % 32 or height % 32):
+            info = (f"{width}x{height} is not an H3 size (sides not multiples of 32 px): all {count} frames "
+                    f"passed through untouched (h3_sizes_only)")
+            grey = torch.full((*images.shape[:3], 3), 0.5, dtype=images.dtype)
+            return {"ui": {"text": [info]}, "result": (images, grey, info)}
 
         # period and phase: once for the whole sequence, from up to 8 frames
         notes = []
@@ -463,8 +503,8 @@ class H3DeGrid:
             if not bool(clean.all()):
                 if parity:  # first: the alternation would read as a jump at every boundary
                     y = y + strength * parity_correction(y, edge_thr)
-                y = y + strength * deblock_axis(y, period, phase_x, max_corr, edge_thr, smooth_along, 3)
-                y = y + strength * deblock_axis(y, period, phase_y, max_corr, edge_thr, smooth_along, 2)
+                y = y + strength * deblock_axis(y, period, phase_x, max_corr, edge_thr, smooth_along, 3, edge_weight)
+                y = y + strength * deblock_axis(y, period, phase_y, max_corr, edge_thr, smooth_along, 2, edge_weight)
                 if plateau == "on":
                     y = y + strength * plateau_correction(y, period, phase_x, phase_y, max_corr, edge_thr)
                 y = torch.where(clean[:, None, None, None], x, y)

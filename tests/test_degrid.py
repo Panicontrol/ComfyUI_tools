@@ -93,10 +93,50 @@ def test_degrid_leaves_clean_and_resized_frames_alone():
 def test_degrid_finds_period_and_phase_once():
     shifted = F.pad(h3_like(plate()), (5, 0, 3, 0), mode="replicate")   # boundaries at 8k+5 / 8k+3
     images = as_images(shifted)
-    out, _, info = degrid(images, period=0, phase_x=-1, phase_y=-1)
+    out, _, info = degrid(images, period=0, phase_x=-1, phase_y=-1, h3_sizes_only=False)   # 515 x 773
     assert "period 8, phase x 5 / y 3" in info and "period 8 found" in info
     _, px, py = measure(out.permute(0, 3, 1, 2))
     assert float(grid_ratio(px, 8.0, 5)[0, 0]) < 1.10 and float(grid_ratio(py, 8.0, 3)[0, 0]) < 1.10
+
+
+def test_degrid_passes_non_h3_sizes_through():
+    images = as_images(h3_like(plate(h=512, w=768)))[:, :504, :760]     # like fal 4K's 2160: not on 32
+    out, removed, info = degrid(images)
+    assert torch.equal(out, images) and "760x504 is not an H3 size" in info
+    assert torch.allclose(removed, torch.full_like(removed, 0.5))
+    out, _, _ = degrid(images, h3_sizes_only=False)
+    assert not torch.equal(out, images)
+
+
+def sill(h=512, w=768):
+    """Horizontal edges off the 8 px grid (a windowsill and its shadows) on a falloff, with grain."""
+    g = torch.Generator().manual_seed(3)
+    yy = torch.arange(h, dtype=torch.float32)[:, None].expand(h, w)
+    img = 0.35 + 0.15 * yy / h
+    y = 40.0
+    while y < h - 40:
+        img = img + float(torch.empty(1).uniform_(-0.06, 0.06, generator=g)) * torch.sigmoid(
+            (yy - y) / float(torch.empty(1).uniform_(0.3, 2.5, generator=g)))
+        y += float(torch.empty(1).uniform_(11, 45, generator=g))
+    img = img[None, None].repeat(1, 3, 1, 1)
+    return (img + 0.45 / 255 * torch.randn(1, 3, h, w, generator=g)).clamp(0, 1)
+
+
+def test_plateau_does_not_shift_edges_through_blocks():
+    images = as_images(torch.cat([h3_like(sill(), i) for i in range(2)]))
+    off, _, _ = degrid(images)
+    on, _, _ = degrid(images, plateau="on")
+    assert ratios(on)[1] <= ratios(off)[1] + 0.01          # y: the edges' direction
+    flicker = lambda t: float((t[1] - t[0]).abs().mean())
+    assert flicker(on) <= flicker(off) * 1.02
+
+
+def test_edge_weight_choices():
+    images = as_images(h3_like(plate()))
+    grain, _, _ = degrid(images)
+    linear, _, _ = degrid(images, edge_weight="linear")
+    assert not torch.equal(grain, linear)
+    assert max(ratios(grain)[:2]) <= max(ratios(linear)[:2]) + 0.005   # flat ground corrected in full
 
 
 def test_degrid_mask_strength_and_plateau():
