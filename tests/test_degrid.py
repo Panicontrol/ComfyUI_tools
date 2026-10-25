@@ -133,8 +133,8 @@ def test_plateau_does_not_shift_edges_through_blocks():
 
 def test_edge_weight_choices():
     images = as_images(h3_like(plate()))
-    grain, _, _ = degrid(images)
-    linear, _, _ = degrid(images, edge_weight="linear")
+    grain, _, _ = degrid(images, edge_weight="above grain")
+    linear, _, _ = degrid(images)                       # the default
     assert not torch.equal(grain, linear)
     assert max(ratios(grain)[:2]) <= max(ratios(linear)[:2]) + 0.005   # flat ground corrected in full
 

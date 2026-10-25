@@ -22,7 +22,7 @@ from .utils import CATEGORY
 U = 1.0 / 255.0
 PARITY_SIGMA = 2.0
 PARITY_LIMIT = 1.5 * U
-EDGE_WEIGHTS = ["above grain", "linear"]
+EDGE_WEIGHTS = ["linear", "above grain"]
 CLEAN_BELOW = 1.05
 PLATEAU_FLAT_SHARE = 0.75  # a block takes part in plateau when this share of it is flat
 OTHER_GRID_BELOW = 1.15  # a weak grid at period, the frame's own grid elsewhere: resized, leave it
@@ -91,7 +91,7 @@ def boundary_centres(size, period, phase):
     return [phase + k * period - 0.5 for k in range(k0, k1 + 1)]
 
 
-def deblock_axis(x, period, phase, max_corr, edge_thr, smooth_along, dim, edge_weight="above grain"):
+def deblock_axis(x, period, phase, max_corr, edge_thr, smooth_along, dim, edge_weight="linear"):
     """Correction for the block boundaries across dim (3 = vertical lines, 2 = horizontal).
 
     Per boundary: the step across it minus the mean of the steps beside it,
@@ -132,7 +132,7 @@ def deblock_axis(x, period, phase, max_corr, edge_thr, smooth_along, dim, edge_w
     return (corr.index_select(-1, nearest) * coef).movedim(-1, dim)
 
 
-def parity_axis(x, dim, weight):
+def parity_axis(x, dim, weight, weight_sum):
     """The 2 px alternation along dim: the Nyquist component, demodulated and smoothed
     with weights (a normalized convolution, so dense texture next to a calm area does not
     leak into its estimate), limited. Subtract it."""
@@ -141,8 +141,7 @@ def parity_axis(x, dim, weight):
     shape = [1, 1, 1, 1]
     shape[dim] = n
     sign = (1.0 - 2.0 * (torch.arange(n, device=x.device) % 2).to(x.dtype)).view(shape)
-    amp = blur(conv_axis(x, k, dim) * sign * weight, PARITY_SIGMA, [3, 2])
-    amp = amp / blur(weight, PARITY_SIGMA, [3, 2]).clamp(min=0.05)
+    amp = blur(conv_axis(x, k, dim) * sign * weight, PARITY_SIGMA, [3, 2]) / weight_sum
     return amp.clamp(-PARITY_LIMIT, PARITY_LIMIT) * sign
 
 
@@ -158,7 +157,8 @@ def parity_correction(x, edge_thr):
     dy = (x[..., 1:, :] - x[..., :-1, :]).abs()
     steps = (F.pad(dx, (1, 0, 0, 0), mode="replicate") + F.pad(dy, (0, 0, 1, 0), mode="replicate")) / 2
     calm = (1 - blur(steps, PARITY_SIGMA, [3, 2]) / edge_thr).clamp(0, 1)
-    return -(parity_axis(x, 3, calm) + parity_axis(x, 2, calm)) * calm
+    calm_sum = blur(calm, PARITY_SIGMA, [3, 2]).clamp(min=0.05)  # shared by both axes
+    return -(parity_axis(x, 3, calm, calm_sum) + parity_axis(x, 2, calm, calm_sum)) * calm
 
 
 def block_index(size, period, phase, device):
@@ -420,11 +420,11 @@ class H3DeGrid:
                                                          "own sizes (1344x768, 1920x1088, 2880x1632, ...) -- are "
                                                          "processed; others (fal 4K 3840x2160, 1080p) pass "
                                                          "through untouched."}),
-                "edge_weight": (EDGE_WEIGHTS, {"default": "above grain",
-                                               "tooltip": "How the correction fades towards real edges. above "
-                                                          "grain: by the steps beside a boundary above the frame's "
-                                                          "usual (grain) step, so flat ground is corrected in full. "
-                                                          "linear: by the whole step, as first specified."}),
+                "edge_weight": (EDGE_WEIGHTS, {"default": "linear",
+                                               "tooltip": "How the correction fades towards real edges. linear: by "
+                                                          "the whole step beside a boundary (best on real H3 frames "
+                                                          "so far). above grain: by the steps above the frame's "
+                                                          "usual grain step -- better in x, worse in y on shot_001."}),
             },
             "optional": {
                 "mask": ("MASK", {"tooltip": "Where to work (white); none = the whole frame."}),
@@ -440,7 +440,7 @@ class H3DeGrid:
 
     def degrid(self, images, period=8.0, phase_x=0.0, phase_y=0.0, strength=1.0, max_correction=4.0,
                edge_threshold=6.0, smooth_along=3.0, plateau="off", parity=True, skip_when_clean=True,
-               h3_sizes_only=True, edge_weight="above grain", mask=None):
+               h3_sizes_only=True, edge_weight="linear", mask=None):
         device = compute_device()
         count, height, width = int(images.shape[0]), int(images.shape[1]), int(images.shape[2])
         max_corr, edge_thr = max_correction * U, edge_threshold * U
