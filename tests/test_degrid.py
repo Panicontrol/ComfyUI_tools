@@ -222,3 +222,22 @@ def test_load_reads_16_bit_png(tmp_path, monkeypatch):
     monkeypatch.setitem(__import__("sys").modules, "cv2", None)   # no OpenCV: Pillow, 8-bit precision
     frame, _ = image_nodes.load_frame(path)
     assert torch.allclose(frame[0], torch.from_numpy(values.astype(np.float32) / 65535), atol=1.5 / 255)
+
+
+def test_save_dither_breaks_up_8_bit_steps(tmp_path):
+    from PIL import Image
+
+    from comfyui_tools.image_nodes import SaveImageSequence
+
+    ramp = torch.linspace(0.5, 0.5 + 2 / 255, 64).view(1, 1, 64, 1).expand(1, 16, 64, 3)  # 2 steps in 64 px
+    for dither in (False, True):
+        SaveImageSequence().save(ramp, str(tmp_path), f"d{int(dither)}", 1, 1, 4, False, dither=dither)
+    plain = np.array(Image.open(os.path.join(str(tmp_path), "d0_v001", "d0_v001.0001.png")), np.float32)
+    dithered = np.array(Image.open(os.path.join(str(tmp_path), "d1_v001", "d1_v001.0001.png")), np.float32)
+    assert len(np.unique(plain[0, :, 0])) == 3 and (np.diff(plain[0, :, 0]) != 0).sum() == 2   # two hard steps
+    assert (np.diff(dithered[0, :, 0]) != 0).sum() > 10                                      # broken up
+    target = ramp[0].numpy() * 255
+    assert abs(float(dithered.mean() - target.mean())) < 0.05 and np.abs(dithered - target).max() <= 1.5
+    SaveImageSequence().save(ramp, str(tmp_path), "d2", 1, 1, 4, False, dither=True)
+    again = np.array(Image.open(os.path.join(str(tmp_path), "d2_v001", "d2_v001.0001.png")), np.float32)
+    assert np.array_equal(again, dithered)                                                   # same on a rerun
