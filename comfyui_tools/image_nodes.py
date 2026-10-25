@@ -714,7 +714,8 @@ class SaveImageSequence:
                     "default": False,
                     "tooltip": "Triangular dither (about 0.4 of an 8-bit step) before rounding to 8 bits, for "
                                "8-bit PNGs and the mp4: after H3 DeGrid, plain rounding puts a step back on many "
-                               "block edges. Same noise on every run.",
+                               "block edges. One pattern for all frames, the same on every run; it still adds a "
+                               "little flicker, so keep PNGs at 16 bits where you can.",
                 }),
             },
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
@@ -789,9 +790,9 @@ class SaveImageSequence:
 
         os.makedirs(project, exist_ok=True)
         values = images[..., :3].float() * 255.0
-        if dither:  # TPDF: two uniform noises, seeded so a rerun writes the same file
+        if dither:  # TPDF, one pattern for every frame (a new one per frame flickers), same on a rerun
             g = torch.Generator().manual_seed(int(number_version))
-            values = values + torch.rand(values.shape, generator=g) - torch.rand(values.shape, generator=g)
+            values = values + (torch.rand(values.shape[1:], generator=g) - torch.rand(values.shape[1:], generator=g))
         pixels = values.clamp(0.0, 255.0).round().to(torch.uint8).cpu().numpy()
 
         if need_save or need_zip:

@@ -29,6 +29,7 @@ CLEAN_BELOW = 1.05
 PLATEAU_FLAT_SHARE = 0.75  # a block takes part in plateau when this share of it is flat
 OTHER_GRID_BELOW = 1.15  # a weak grid at period, the frame's own grid elsewhere: resized, leave it
 FLAT_PERCENTILE = 0.4
+CALM_LOW, CALM_HIGH = 0.4, 0.7  # local sigma quantiles: full correction below, none above
 
 
 def compute_device():
@@ -93,7 +94,7 @@ def boundary_centres(size, period, phase):
     return [phase + k * period - 0.5 for k in range(k0, k1 + 1)]
 
 
-def deblock_axis(x, period, phase, max_corr, edge_thr, smooth_along, dim, edge_weight="above grain"):
+def deblock_axis(x, period, phase, max_corr, edge_thr, smooth_along, dim, edge_weight="above grain", calm=None):
     """Correction for the block boundaries across dim (3 = vertical lines, 2 = horizontal).
 
     Per boundary: the step across it minus the mean of the steps beside it,
@@ -122,6 +123,9 @@ def deblock_axis(x, period, phase, max_corr, edge_thr, smooth_along, dim, edge_w
     else:
         grain = beside.flatten(-2).median(-1).values[..., None, None].clamp(max=edge_thr / 3)
         weight = (1 - (beside - grain).clamp(min=0) / (edge_thr - grain)).clamp(0, 1)
+    if calm is not None:  # how flat the ground is at the boundary (1 flat .. 0 texture)
+        c = calm.movedim(dim, -1)
+        weight = weight * torch.minimum(sample_last(c, u - 0.5), sample_last(c, u + 0.5))
     corr = blur(excess * weight, smooth_along, [2]).clamp(-max_corr, max_corr)
 
     # every pixel takes the ramp of its nearest boundary
@@ -134,14 +138,24 @@ def deblock_axis(x, period, phase, max_corr, edge_thr, smooth_along, dim, edge_w
     return (corr.index_select(-1, nearest) * coef).movedim(-1, dim)
 
 
-def parity_correction(x, phase_x, phase_y, edge_thr, smooth_along):
+def parity_correction(x, phase_x, phase_y, edge_thr, smooth_along, edge_weight="above grain", calm=None):
     """Correction for the 2 px parity: every even step (relative to the grid) treated as
     a small block boundary, its excess over the odd steps beside it measured, smoothed
     along the line and spread over its two pixels. Measured per position, so a parity
     that changes along the block (larger towards a block's last rows in y) goes too; a
     Nyquist estimate smoothed across the lines only sees its average."""
-    y = x + deblock_axis(x, 2.0, phase_x % 2, PARITY_LIMIT, edge_thr, smooth_along, 3, "linear")
-    return y + deblock_axis(y, 2.0, phase_y % 2, PARITY_LIMIT, edge_thr, smooth_along, 2, "linear") - x
+    y = x + deblock_axis(x, 2.0, phase_x % 2, PARITY_LIMIT, edge_thr, smooth_along, 3, edge_weight, calm)
+    return y + deblock_axis(y, 2.0, phase_y % 2, PARITY_LIMIT, edge_thr, smooth_along, 2, edge_weight, calm) - x
+
+
+def calm_map(x, low=CALM_LOW, high=CALM_HIGH):
+    """1 where the local sigma (9 x 9) is below the frame's low quantile, fading to 0 at its
+    high quantile: flat ground gets the full correction, texture none. Steps beside a boundary
+    alone cannot tell grain from fine texture (granite, foliage); this keeps detail and
+    flicker where they were while flat ground, where the grid shows, is corrected in full."""
+    sigma = local_sigma(x)
+    lo, hi = percentile_per_frame(sigma, low), percentile_per_frame(sigma, high)
+    return ((hi - sigma) / (hi - lo).clamp(min=1e-6)).clamp(0, 1)
 
 
 def block_index(size, period, phase, device):
@@ -486,10 +500,11 @@ class H3DeGrid:
 
             y = x
             if not bool(clean.all()):
-                y = y + strength * deblock_axis(y, period, phase_x, max_corr, edge_thr, smooth_along, 3, edge_weight)
-                y = y + strength * deblock_axis(y, period, phase_y, max_corr, edge_thr, smooth_along, 2, edge_weight)
+                calm = calm_map(x)  # from the input: where the ground is flat
+                y = y + strength * deblock_axis(y, period, phase_x, max_corr, edge_thr, smooth_along, 3, edge_weight, calm)
+                y = y + strength * deblock_axis(y, period, phase_y, max_corr, edge_thr, smooth_along, 2, edge_weight, calm)
                 if parity:  # after the boundaries: their jumps are no longer read as parity
-                    y = y + strength * parity_correction(y, phase_x, phase_y, edge_thr, smooth_along)
+                    y = y + strength * parity_correction(y, phase_x, phase_y, edge_thr, smooth_along, edge_weight, calm)
                 if plateau == "on":
                     y = y + strength * plateau_correction(y, period, phase_x, phase_y, max_corr, edge_thr)
                 y = torch.where(clean[:, None, None, None], x, y)
