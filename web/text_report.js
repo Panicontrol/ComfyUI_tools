@@ -5,7 +5,7 @@
 
 import { app } from "../../scripts/app.js";
 
-const NODES = new Set(["ToolsLatentInfo", "ToolsH3LatentCheck", "ToolsShotFinalize"]);
+const NODES = new Set(["ToolsLatentInfo", "ToolsH3LatentCheck", "ToolsH3DeGrid", "ToolsShotFinalize"]);
 const LINE = 16;
 const PAD = 10;
 const TOP = 56; // below the title and one socket row, when there are no widgets

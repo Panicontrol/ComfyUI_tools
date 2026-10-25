@@ -63,8 +63,49 @@ def list_sequence(directory, pattern):
     return names
 
 
+def png_bit_depth(path):
+    """Bit depth from a PNG's header, 0 if the file is not a PNG."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(26)
+    except OSError:
+        return 0
+    return head[24] if head[:8] == b"\x89PNG\r\n\x1a\n" and len(head) == 26 else 0
+
+
+def load_png16(path):
+    """A 16-bit PNG at full precision through OpenCV; None when OpenCV is not installed
+    (Pillow then reads it at 8 bits)."""
+    try:
+        import cv2
+    except ImportError:
+        return None
+    data = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if data is None:
+        return None
+    data = data.astype(np.float32) / (65535.0 if data.dtype == np.uint16 else 255.0)
+    if data.ndim == 2:
+        data = data[..., None]
+    if data.shape[-1] == 1:
+        rgb, alpha = np.repeat(data, 3, -1), None
+    elif data.shape[-1] == 2:
+        rgb, alpha = np.repeat(data[..., :1], 3, -1), data[..., 1]
+    else:
+        rgb, alpha = data[..., 2::-1], (data[..., 3] if data.shape[-1] == 4 else None)
+    frame = torch.from_numpy(np.ascontiguousarray(rgb)).unsqueeze(0)
+    if alpha is None:
+        mask = torch.zeros((1, frame.shape[1], frame.shape[2]), dtype=torch.float32)
+    else:
+        mask = torch.from_numpy(1.0 - alpha).unsqueeze(0)
+    return frame, mask
+
+
 def load_frame(path):
     """One file as ``([1, H, W, 3], [1, H, W])`` image and mask tensors."""
+    if png_bit_depth(path) == 16:
+        loaded = load_png16(path)
+        if loaded is not None:
+            return loaded
     with Image.open(path) as opened:
         image = ImageOps.exif_transpose(opened)
 
@@ -523,6 +564,30 @@ def output_directory(directory):
         return os.path.abspath(path)
 
 
+def png16_bytes(array):
+    """PNG file bytes of an ``[H, W, 3 | 4]`` uint16 array, 16 bits per channel.
+
+    Pillow cannot write 16-bit RGB, so the file is built here: Sub filter on
+    every row, zlib, nothing else needed by any PNG reader.
+    """
+    import struct
+    import zlib
+
+    height, width, channels = array.shape
+    rows = np.ascontiguousarray(array.astype(">u2")).view(np.uint8).reshape(height, width * channels * 2)
+    bpp = channels * 2
+    filtered = rows.copy()
+    filtered[:, bpp:] = rows[:, bpp:] - rows[:, :-bpp]  # uint8 arithmetic wraps mod 256, as PNG wants
+    body = np.concatenate([np.ones((height, 1), np.uint8), filtered], 1).tobytes()
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    header = struct.pack(">IIBBBBB", width, height, 16, 2 if channels == 3 else 6, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(body, 4))
+            + chunk(b"IEND", b""))
+
+
 def write_mp4(path, pixels, frame_rate, metadata=None):
     """Encode ``[N, H, W, 3]`` uint8 frames as an H.264 mp4.
 
@@ -577,7 +642,7 @@ class SaveImageSequence:
       depth_v004.latent                     latent connected: for Load Latent From
       depth_v004.notes.txt                  notes connected: "depth_v004" + the notes
       depth_v004.zip                        need_zip: the frames, zipped
-      depth_v004/depth_v004.01001.png ...   need_save: the frames
+      depth_v004/depth_v004.01001.png ...   need_save: the frames (8 or 16 bits, bit_depth)
 
     number_version has ComfyUI's "control after generate" switch, set to
     increment, so every run is a new version. Masks go into the PNGs' alpha
@@ -640,6 +705,11 @@ class SaveImageSequence:
                                "with Text Concat. Saved under the version name as the mp4's notes tag and "
                                "as <name>_v###.notes.txt; empty = neither.",
                 }),
+                "bit_depth": (["8", "16"], {
+                    "default": "8",
+                    "tooltip": "Bits per channel of the PNGs. 16 keeps float results (e.g. H3 DeGrid's) "
+                               "without 8-bit rounding steps; the mp4 stays 8-bit.",
+                }),
             },
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
@@ -655,7 +725,7 @@ class SaveImageSequence:
     def save(self, images, save_folder, new_folder, number_version, start_frame_index,
              padding_frame_name, overwrite, masks=None, frame_rate=24.0, need_save=True,
              need_zip=False, embed_workflow=True, save_workflow_json=False, latent=None, notes=None,
-             prompt=None, extra_pnginfo=None):
+             bit_depth="8", prompt=None, extra_pnginfo=None):
         import io
         import zipfile
 
@@ -708,6 +778,7 @@ class SaveImageSequence:
             if masks.shape[0] not in (1, frames):
                 raise ValueError(f"the masks have {masks.shape[0]} frames but the images have {frames}")
             alpha = (1.0 - resize_mask(masks, images.shape[2], images.shape[1])).clamp(0.0, 1.0)
+            alpha16 = alpha if str(bit_depth) == "16" else None
             alpha = (alpha * 255.0).round().to(torch.uint8).cpu().numpy()
 
         os.makedirs(project, exist_ok=True)
@@ -719,14 +790,20 @@ class SaveImageSequence:
             archive = zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) if need_zip else None
             try:
                 for index, filename in enumerate(names):
-                    if alpha is None:
-                        image = Image.fromarray(pixels[index], "RGB")
+                    if str(bit_depth) == "16":
+                        frame = images[index].clamp(0.0, 1.0)
+                        if alpha is not None:
+                            frame = torch.cat([frame, alpha16[0 if alpha16.shape[0] == 1 else index][..., None]], -1)
+                        data = png16_bytes((frame * 65535.0).round().to(torch.int32).cpu().numpy().astype(np.uint16))
                     else:
-                        a = alpha[0 if alpha.shape[0] == 1 else index]
-                        image = Image.fromarray(np.dstack([pixels[index], a]), "RGBA")
-                    buffer = io.BytesIO()
-                    image.save(buffer, format="PNG", compress_level=4)
-                    data = buffer.getvalue()
+                        if alpha is None:
+                            image = Image.fromarray(pixels[index], "RGB")
+                        else:
+                            a = alpha[0 if alpha.shape[0] == 1 else index]
+                            image = Image.fromarray(np.dstack([pixels[index], a]), "RGBA")
+                        buffer = io.BytesIO()
+                        image.save(buffer, format="PNG", compress_level=4)
+                        data = buffer.getvalue()
                     if need_save:
                         with open(os.path.join(folder, filename), "wb") as handle:
                             handle.write(data)
