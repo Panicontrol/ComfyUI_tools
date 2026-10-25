@@ -1,11 +1,14 @@
 """H3 DeGrid: remove the MiniMax H3 decoder's 8 px block grid from decoded frames.
 
-The H3 VAE leaves a grid of 8x8 px blocks tied to the frame origin: a jump in
-tone across every block boundary, flat plateaus inside blocks, and a 2 px
-parity (steps on odd positions larger than on even ones). The blocks shift
-independently, with their own sign, frame to frame, so no fixed pattern or
-notch filter removes them; this is deblocking -- the jump across each block
-boundary is measured against the steps beside it and spread back as a ramp.
+The H3 VAE leaves a grid tied to the frame origin: a jump in tone across every
+8 px block boundary (every other one, the 16 px latent cell's, stronger), flat
+plateaus inside blocks, and a 2 px parity from its last 2x upsampling -- the
+steps on even positions larger than on odd ones, by an amount that changes
+along the block (in y it grows towards the block's last rows). The blocks
+shift independently, with their own sign, frame to frame, so no fixed pattern
+or notch filter removes them; this is deblocking -- the jump across each block
+boundary is measured against the steps beside it and spread back as a ramp,
+then the same, two pixels wide, at every even step.
 
 All work is per RGB channel in float32 on the GPU, a few frames at a time; the
 result stays float (no 8-bit rounding), alpha passes through. Values below
@@ -20,9 +23,8 @@ import torch.nn.functional as F
 from .utils import CATEGORY
 
 U = 1.0 / 255.0
-PARITY_SIGMA = 2.0
 PARITY_LIMIT = 1.5 * U
-EDGE_WEIGHTS = ["linear", "above grain"]
+EDGE_WEIGHTS = ["above grain", "linear"]
 CLEAN_BELOW = 1.05
 PLATEAU_FLAT_SHARE = 0.75  # a block takes part in plateau when this share of it is flat
 OTHER_GRID_BELOW = 1.15  # a weak grid at period, the frame's own grid elsewhere: resized, leave it
@@ -91,7 +93,7 @@ def boundary_centres(size, period, phase):
     return [phase + k * period - 0.5 for k in range(k0, k1 + 1)]
 
 
-def deblock_axis(x, period, phase, max_corr, edge_thr, smooth_along, dim, edge_weight="linear"):
+def deblock_axis(x, period, phase, max_corr, edge_thr, smooth_along, dim, edge_weight="above grain"):
     """Correction for the block boundaries across dim (3 = vertical lines, 2 = horizontal).
 
     Per boundary: the step across it minus the mean of the steps beside it,
@@ -132,33 +134,14 @@ def deblock_axis(x, period, phase, max_corr, edge_thr, smooth_along, dim, edge_w
     return (corr.index_select(-1, nearest) * coef).movedim(-1, dim)
 
 
-def parity_axis(x, dim, weight, weight_sum):
-    """The 2 px alternation along dim: the Nyquist component, demodulated and smoothed
-    with weights (a normalized convolution, so dense texture next to a calm area does not
-    leak into its estimate), limited. Subtract it."""
-    k = torch.tensor([1.0, -4.0, 6.0, -4.0, 1.0], device=x.device) / 16
-    n = x.shape[dim]
-    shape = [1, 1, 1, 1]
-    shape[dim] = n
-    sign = (1.0 - 2.0 * (torch.arange(n, device=x.device) % 2).to(x.dtype)).view(shape)
-    amp = blur(conv_axis(x, k, dim) * sign * weight, PARITY_SIGMA, [3, 2]) / weight_sum
-    return amp.clamp(-PARITY_LIMIT, PARITY_LIMIT) * sign
-
-
-def parity_correction(x, edge_thr):
-    """Correction for the 2 px parity along x and y, weighted by how calm the picture is:
-    where the mean step reaches edge_thr (dense texture) the filter would take real detail,
-    so it does nothing there.
-
-    One pass: a second one, before deblocking, mostly takes the filter's answer to the
-    block steps, and after it the answer to the ramps' kinks; both made grid and parity
-    worse in tests."""
-    dx = (x[..., :, 1:] - x[..., :, :-1]).abs()
-    dy = (x[..., 1:, :] - x[..., :-1, :]).abs()
-    steps = (F.pad(dx, (1, 0, 0, 0), mode="replicate") + F.pad(dy, (0, 0, 1, 0), mode="replicate")) / 2
-    calm = (1 - blur(steps, PARITY_SIGMA, [3, 2]) / edge_thr).clamp(0, 1)
-    calm_sum = blur(calm, PARITY_SIGMA, [3, 2]).clamp(min=0.05)  # shared by both axes
-    return -(parity_axis(x, 3, calm, calm_sum) + parity_axis(x, 2, calm, calm_sum)) * calm
+def parity_correction(x, phase_x, phase_y, edge_thr, smooth_along):
+    """Correction for the 2 px parity: every even step (relative to the grid) treated as
+    a small block boundary, its excess over the odd steps beside it measured, smoothed
+    along the line and spread over its two pixels. Measured per position, so a parity
+    that changes along the block (larger towards a block's last rows in y) goes too; a
+    Nyquist estimate smoothed across the lines only sees its average."""
+    y = x + deblock_axis(x, 2.0, phase_x % 2, PARITY_LIMIT, edge_thr, smooth_along, 3, "linear")
+    return y + deblock_axis(y, 2.0, phase_y % 2, PARITY_LIMIT, edge_thr, smooth_along, 2, "linear") - x
 
 
 def block_index(size, period, phase, device):
@@ -409,9 +392,11 @@ class H3DeGrid:
                                                       "boundary, so a block is corrected, not the noise."}),
                 "plateau": (["off", "on"], {"default": "off",
                                             "tooltip": "Also pull the tone of flat blocks towards a smooth "
-                                                       "surface through their neighbours (the squares a strong "
-                                                       "grade shows); texture inside blocks stays."}),
-                "parity": ("BOOLEAN", {"default": True, "tooltip": "Remove the 2 px alternation."}),
+                                                       "surface through their neighbours; texture inside blocks "
+                                                       "stays. On shot_001 it helps x but leaves y worse: off."}),
+                "parity": ("BOOLEAN", {"default": True,
+                                       "tooltip": "Remove the 2 px parity: every even step treated as a small "
+                                                  "boundary, after the 8 px ones."}),
                 "skip_when_clean": ("BOOLEAN", {"default": True,
                                                 "tooltip": "Frames whose grid (and parity) measure below 1.05 "
                                                            "pass through untouched."}),
@@ -420,11 +405,11 @@ class H3DeGrid:
                                                          "own sizes (1344x768, 1920x1088, 2880x1632, ...) -- are "
                                                          "processed; others (fal 4K 3840x2160, 1080p) pass "
                                                          "through untouched."}),
-                "edge_weight": (EDGE_WEIGHTS, {"default": "linear",
-                                               "tooltip": "How the correction fades towards real edges. linear: by "
-                                                          "the whole step beside a boundary (best on real H3 frames "
-                                                          "so far). above grain: by the steps above the frame's "
-                                                          "usual grain step -- better in x, worse in y on shot_001."}),
+                "edge_weight": (EDGE_WEIGHTS, {"default": "above grain",
+                                               "tooltip": "How the block boundary correction fades towards real "
+                                                          "edges. above grain: by the steps beside a boundary above "
+                                                          "the frame's usual grain step, so flat ground is corrected "
+                                                          "in full (best with parity on). linear: by the whole step."}),
             },
             "optional": {
                 "mask": ("MASK", {"tooltip": "Where to work (white); none = the whole frame."}),
@@ -440,7 +425,7 @@ class H3DeGrid:
 
     def degrid(self, images, period=8.0, phase_x=0.0, phase_y=0.0, strength=1.0, max_correction=4.0,
                edge_threshold=6.0, smooth_along=3.0, plateau="off", parity=True, skip_when_clean=True,
-               h3_sizes_only=True, edge_weight="linear", mask=None):
+               h3_sizes_only=True, edge_weight="above grain", mask=None):
         device = compute_device()
         count, height, width = int(images.shape[0]), int(images.shape[1]), int(images.shape[2])
         max_corr, edge_thr = max_correction * U, edge_threshold * U
@@ -501,10 +486,10 @@ class H3DeGrid:
 
             y = x
             if not bool(clean.all()):
-                if parity:  # first: the alternation would read as a jump at every boundary
-                    y = y + strength * parity_correction(y, edge_thr)
                 y = y + strength * deblock_axis(y, period, phase_x, max_corr, edge_thr, smooth_along, 3, edge_weight)
                 y = y + strength * deblock_axis(y, period, phase_y, max_corr, edge_thr, smooth_along, 2, edge_weight)
+                if parity:  # after the boundaries: their jumps are no longer read as parity
+                    y = y + strength * parity_correction(y, phase_x, phase_y, edge_thr, smooth_along)
                 if plateau == "on":
                     y = y + strength * plateau_correction(y, period, phase_x, phase_y, max_corr, edge_thr)
                 y = torch.where(clean[:, None, None, None], x, y)
