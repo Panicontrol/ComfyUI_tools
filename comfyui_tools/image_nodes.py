@@ -124,9 +124,16 @@ def load_frame(path):
 
 
 class ImageResize:
-    """Resize an image by longest/shortest side, megapixels or explicit size."""
+    """Resize an image by longest/shortest side, megapixels, explicit size or a scale factor.
 
-    MODES = ["longest_side", "shortest_side", "megapixels", "width_height"]
+    Outputs (or inputs) over 64 megapixels are resized in float with Pillow's
+    filters a strip of rows at a time (on the GPU when there is one), so a
+    19584 x 6264 frame never needs two full frames in memory and is not rounded
+    to 8 bits on the way.
+    """
+
+    MODES = ["longest_side", "shortest_side", "megapixels", "width_height", "scale_factor"]
+    LARGE = 64_000_000  # pixels: from here on, the strip resampler
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -134,14 +141,20 @@ class ImageResize:
             "required": {
                 "image": ("IMAGE",),
                 "mode": (cls.MODES, {"default": "longest_side"}),
-                "target_side": ("INT", {"default": 1024, "min": 16, "max": 16384, "step": 8}),
-                "megapixels": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 64.0, "step": 0.01}),
-                "width": ("INT", {"default": 1024, "min": 16, "max": 16384, "step": 8}),
-                "height": ("INT", {"default": 1024, "min": 16, "max": 16384, "step": 8}),
+                "target_side": ("INT", {"default": 1024, "min": 16, "max": 65536, "step": 1}),
+                "megapixels": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 1024.0, "step": 0.01}),
+                "width": ("INT", {"default": 1024, "min": 16, "max": 65536, "step": 1}),
+                "height": ("INT", {"default": 1024, "min": 16, "max": 65536, "step": 1}),
                 "keep_aspect": ("BOOLEAN", {"default": True}),
                 "multiple_of": ("INT", {"default": 8, "min": 1, "max": 256, "step": 1}),
                 "interpolation": (INTERPOLATION_MODES, {"default": "lanczos"}),
-            }
+            },
+            "optional": {
+                "scale_factor": ("FLOAT", {
+                    "default": 1.0, "min": 0.05, "max": 16.0, "step": 0.001,
+                    "tooltip": "Mode scale_factor: round(width * f) x round(height * f), then multiple_of.",
+                }),
+            },
         }
 
     RETURN_TYPES = ("IMAGE", "INT", "INT")
@@ -149,8 +162,11 @@ class ImageResize:
     FUNCTION = "resize"
     CATEGORY = f"{CATEGORY}/image"
 
-    def target_size(self, src_w, src_h, mode, target_side, megapixels, width, height, keep_aspect):
+    def target_size(self, src_w, src_h, mode, target_side, megapixels, width, height, keep_aspect,
+                    scale_factor=1.0):
         aspect = src_w / src_h
+        if mode == "scale_factor":
+            return round(src_w * scale_factor), round(src_h * scale_factor)
         if mode == "longest_side":
             if src_w >= src_h:
                 return target_side, target_side / aspect
@@ -168,13 +184,27 @@ class ImageResize:
         return src_w * scale, src_h * scale
 
     def resize(self, image, mode, target_side, megapixels, width, height,
-               keep_aspect, multiple_of, interpolation):
+               keep_aspect, multiple_of, interpolation, scale_factor=1.0):
         src_h, src_w = image.shape[1], image.shape[2]
         new_w, new_h = self.target_size(
-            src_w, src_h, mode, target_side, megapixels, width, height, keep_aspect
+            src_w, src_h, mode, target_side, megapixels, width, height, keep_aspect, scale_factor
         )
         new_w = round_to_multiple(new_w, multiple_of)
         new_h = round_to_multiple(new_h, multiple_of)
+        if (new_w, new_h) == (src_w, src_h):
+            return (image, new_w, new_h)
+        kind = {"lanczos": "lanczos", "bicubic": "bicubic", "bilinear": "bilinear", "area": "box"}.get(interpolation)
+        if kind and max(new_w * new_h, src_w * src_h) > self.LARGE:
+            from . import resample
+
+            try:
+                import comfy.model_management
+
+                device = comfy.model_management.get_torch_device()
+            except Exception:
+                device = None
+            out = resample.resize(image, new_w, new_h, kind, device=device)
+            return (out.clamp(0.0, 1.0), new_w, new_h)
         return (resize_image(image, new_w, new_h, interpolation), new_w, new_h)
 
 
