@@ -33,7 +33,7 @@ def load(directory, **kwargs):
         "on_size_mismatch": "error",
     }
     params.update(kwargs)
-    return LoadImageSequence().load(**params)
+    return LoadImageSequence().load(**params)[:4]
 
 
 def test_natural_key_orders_frames_like_a_sequence():
@@ -174,3 +174,27 @@ def test_is_changed_on_a_missing_folder(tmp_path):
 
 def test_quotes_and_user_paths_are_accepted(sequence):
     assert load(f'"{sequence}"')[2] == 3
+
+
+def test_index_steps_through_the_sequence_one_piece_per_run(tmp_path):
+    from PIL import Image
+
+    for n in range(1001, 1008):
+        Image.new("RGB", (4, 2), (n - 1000, 0, 0)).save(tmp_path / f"seq01.{n}.png")
+    node = LoadImageSequence()
+    run = lambda **kw: node.load(str(tmp_path), "*.png", "name", False, kw.get("start_index", 0), kw.get("step", 1),
+                                 kw.get("count", 1), "error", kw.get("index", 0))
+    images, _, count, names, first, number, total = run(index=0)
+    assert (count, names, first, number, total) == (1, "seq01.1001.png", 0, 1001, 7)
+    images, _, count, names, first, number, total = run(index=3)
+    assert (names, first, number) == ("seq01.1004.png", 3, 1004) and round(float(images[0, 0, 0, 0]) * 255) == 4
+    _, _, count, names, first, number, _ = run(count=3, index=2)          # the last, short piece
+    assert (count, names, number) == (1, "seq01.1007.png", 1007)
+    _, _, _, names, first, number, total = run(start_index=2, step=2, index=1)
+    assert (names, first, number, total) == ("seq01.1005.png", 4, 1005, 3)
+    with pytest.raises(ValueError, match=r"index 7 is past the end: 7 frames .* \(index 0 to 6\)"):
+        run(index=7)
+    with pytest.raises(ValueError, match="index needs a count"):
+        run(count=0, index=1)
+    changed = lambda i: LoadImageSequence.IS_CHANGED(str(tmp_path), "*.png", "name", False, 0, 1, 1, "error", index=i)
+    assert changed(0) != changed(1)
